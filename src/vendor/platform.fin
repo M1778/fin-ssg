@@ -1,0 +1,47 @@
+// Native Linux ABI policy, shared by the CLI and mapping regression tests.
+// O_DIRECTORY/O_NOFOLLOW are architecture-specific; never guess a fallback.
+import { equals, from_chars, free_str } from strings::std;
+namespace fin {
+#[llvm_name="uname"]
+@define platform_uname(buf: &char) <int>;
+
+pub struct LinuxOpenFlags { directory <int>, read_file <int>, create_file <int>, ok <bool> }
+
+pub fun linux_open_flags(system: string, machine: string) <LinuxOpenFlags> {
+    let flags <LinuxOpenFlags> = LinuxOpenFlags{directory: 0, read_file: 0, create_file: 0, ok: false};
+    if (!equals(system, "Linux")) { return flags; }
+    if (equals(machine, "x86_64")) {
+        // CLOEXEC=524288, DIRECTORY=65536, NOFOLLOW=131072.
+        flags.directory = 720896;
+        flags.read_file = 657408;
+        flags.create_file = 655553;
+        flags.ok = true;
+    } else if (equals(machine, "aarch64")) {
+        // CLOEXEC=524288, DIRECTORY=16384, NOFOLLOW=32768.
+        // Read adds NONBLOCK=2048; creation adds WRONLY|CREAT|EXCL=193.
+        flags.directory = 573440;
+        flags.read_file = 559104;
+        flags.create_file = 557249;
+        flags.ok = true;
+    }
+    return flags;
+}
+
+pub fun detect_linux_open_flags() <LinuxOpenFlags> {
+    let unsupported <LinuxOpenFlags> = LinuxOpenFlags{directory: 0, read_file: 0, create_file: 0, ok: false};
+    // Linux struct utsname: six 65-byte fields; machine begins at byte 260.
+    let bytes <[char]> = new [char, 390]{};
+    if (platform_uname(&bytes[0]) != 0) { delete bytes; return unsupported; }
+    let system_end <int> = 0;
+    while (system_end < 65 && bytes[system_end] != cast<char>(0)) { system_end++; }
+    let machine_end <int> = 260;
+    while (machine_end < 325 && bytes[machine_end] != cast<char>(0)) { machine_end++; }
+    if (system_end == 65 || machine_end == 325) { delete bytes; return unsupported; }
+    let system <string> = from_chars(bytes, 0, system_end);
+    let machine <string> = from_chars(bytes, 260, machine_end - 260);
+    let flags <LinuxOpenFlags> = linux_open_flags(system, machine);
+    if (!flags.ok) { printf("error: unsupported platform %s/%s (requires Linux x86_64 or aarch64)\n", system, machine); }
+    free_str(system); free_str(machine); delete bytes;
+    return flags;
+}
+}

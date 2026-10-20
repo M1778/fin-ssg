@@ -5,6 +5,7 @@ import { walk_dir } from fs::std;
 import { len, equals, ends_with, substr, concat, clone, to_lower, to_chars, from_chars, free_str, compare } from strings::std;
 import { TextBuffer, text_buffer, text_char, text_append, text_finish, md_to_html, md_escape_into, filename_url } from markdown::fin;
 import { tpl_render } from template::fin;
+import { LinuxOpenFlags, detect_linux_open_flags } from platform::fin;
 
 #[llvm_name="open"]
 @define ssg_open(path: string, flags: int) <int>;
@@ -35,10 +36,6 @@ const MAX_ARGS <int> = 256;
 const MAX_ARG_BYTES <int> = 65536;
 const MAX_FILES <int> = 4096;
 const MAX_INPUT <int> = 4194304;
-// Linux O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC.
-const DIR_FLAGS <int> = 720896;
-// O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC.
-const READ_FLAGS <int> = 657408;
 
 struct Argv { args <[string]>, count <int>, ok <bool> }
 fun read_argv() <Argv> {
@@ -81,13 +78,14 @@ fun free_argv(argv: &Argv) <noret> {
 
 // Walk every path component without following symlinks, including ancestors.
 // '..' is deliberately refused. The returned fd pins the final directory.
-fun open_directory(path: string, create: bool) <int> {
+fun open_directory(path: string, create: bool, abi: LinuxOpenFlags) <int> {
+    if (!abi.ok) { *ssg_errno() = 22; return -1; }
     let chars <[char]> = to_chars(path);
     let total <int> = chars.length - 1;
     if (total == 0) { delete chars; *ssg_errno() = 22; return -1; }
     let base <string> = ".";
     if (chars[0] == '/') { base = "/"; }
-    let fd <int> = ssg_open(base, DIR_FLAGS);
+    let fd <int> = ssg_open(base, abi.directory);
     let i <int> = 0;
     while (fd >= 0 && i < total) {
         while (i < total && chars[i] == '/') { i++; }
@@ -97,10 +95,10 @@ fun open_directory(path: string, create: bool) <int> {
         let part <string> = from_chars(chars, start, i - start);
         if (equals(part, ".")) { free_str(part); continue; }
         if (equals(part, "..")) { free_str(part); ssg_close(fd); fd = -1; *ssg_errno() = 22; break; }
-        let next <int> = ssg_openat(fd, part, DIR_FLAGS, 0);
+        let next <int> = ssg_openat(fd, part, abi.directory, 0);
         if (next < 0 && create && *ssg_errno() == 2) {
             ssg_mkdirat(fd, part, 493);
-            next = ssg_openat(fd, part, DIR_FLAGS, 0);
+            next = ssg_openat(fd, part, abi.directory, 0);
         }
         free_str(part); ssg_close(fd); fd = next;
     }
@@ -127,8 +125,9 @@ fun regular_file(fd: int, path: string, empty: bool) <int> {
     return -1;
 }
 
-fun? read_file(fd: int, name: string) <string> {
-    let file <int> = ssg_openat(fd, name, READ_FLAGS, 0);
+fun? read_file(fd: int, name: string, abi: LinuxOpenFlags) <string> {
+    if (!abi.ok) { return null; }
+    let file <int> = ssg_openat(fd, name, abi.read_file, 0);
     if (file < 0) { return null; }
     if (regular_file(file, "", true) != 1) { ssg_close(file); return null; }
     let buf <[char]> = new [char, MAX_INPUT + 1]{};
@@ -151,14 +150,15 @@ fun? read_file(fd: int, name: string) <string> {
 
 // Exclusive temp creation and rename relative to the same pinned directory.
 // Reject existing special files. A raced-in symlink is replaced, never followed.
-fun atomic_write(dir: int, dest: string, text: string) <bool> {
+fun atomic_write(dir: int, dest: string, text: string, abi: LinuxOpenFlags) <bool> {
+    if (!abi.ok) { return false; }
     if (regular_file(dir, dest, false) < 0) { return false; }
     let temp <string> = "";
     let fd <int> = -1;
     for (let attempt <int> = 0; attempt < 128; attempt++) {
         temp = format!(".fin-ssg-{}-{}.tmp", ssg_pid(), attempt);
         // WRONLY|CREAT|EXCL|NOFOLLOW|CLOEXEC; mode 0644 respects umask.
-        fd = ssg_openat(dir, temp, 655553, 420);
+        fd = ssg_openat(dir, temp, abi.create_file, 420);
         if (fd >= 0) { break; }
         let exists <bool> = *ssg_errno() == 17;
         free_str(temp);
@@ -269,7 +269,7 @@ fun print_usage() <noret> {
     printf("usage: fin-ssg [--content DIR] [--layout DIR] [--out DIR] [--title TITLE]\n");
     printf("Aliases: -c, -l, -o, -t; --help/-h. Defaults: content, layout, public, My Site.\n");
     printf("Limits: 256 arguments / 65536 argv bytes, 4096 Markdown files, 4 MiB per input, 32 MiB per rendered output.\n");
-    printf("Linux/procfs/statx required; symlink paths and '..' components refused. Layouts are trusted HTML.\n");
+    printf("Linux x86_64/aarch64, procfs and statx required; symlink paths and '..' components refused. Layouts are trusted HTML.\n");
 }
 
 // Reserve the generated homepage and reject ASCII case-folded collisions so
@@ -295,8 +295,8 @@ fun safe_names(files: &FileList) <bool> {
     return ok;
 }
 
-fun build_site(content: string, layout_dir: string, out: string, title: string) <int> {
-    let input <int> = open_directory(content, false);
+fun build_site(content: string, layout_dir: string, out: string, title: string, abi: LinuxOpenFlags) <int> {
+    let input <int> = open_directory(content, false, abi);
     if (input < 0) { printf("error: content must be a readable, non-symlink directory: %s\n", content); return 1; }
     let files <FileList> = list_md_files(input);
     if (!files.ok || files.count == 0) {
@@ -309,7 +309,7 @@ fun build_site(content: string, layout_dir: string, out: string, title: string) 
         free_files(&files); ssg_close(input); return 1;
     }
     let layout <string> = clone(default_layout());
-    let layout_fd <int> = open_directory(layout_dir, false);
+    let layout_fd <int> = open_directory(layout_dir, false, abi);
     let layout_error <bool> = false;
     if (layout_fd < 0) {
         if (*ssg_errno() != 2) { layout_error = true; }
@@ -317,7 +317,7 @@ fun build_site(content: string, layout_dir: string, out: string, title: string) 
         let state <int> = regular_file(layout_fd, "page.html", false);
         if (state < 0) { layout_error = true; }
         else if (state == 1) {
-            let value? <string> = read_file(layout_fd, "page.html");
+            let value? <string> = read_file(layout_fd, "page.html", abi);
             if (value == null) { layout_error = true; }
             else { free_str(layout); layout = value?; }
         }
@@ -327,7 +327,7 @@ fun build_site(content: string, layout_dir: string, out: string, title: string) 
         printf("error: unsafe/unreadable layout or input exceeds 4 MiB\n");
         free_str(layout); free_files(&files); ssg_close(input); return 1;
     }
-    let output <int> = open_directory(out, true);
+    let output <int> = open_directory(out, true, abi);
     if (output < 0) {
         printf("error: cannot open/create non-symlink output directory: %s\n", out);
         free_str(layout); free_files(&files); ssg_close(input); return 1;
@@ -348,7 +348,7 @@ fun build_site(content: string, layout_dir: string, out: string, title: string) 
     let built <int> = 0; let failed <int> = 0;
     for (let i <int> = 0; i < files.count; i++) {
         let name <string> = files.files[i];
-        let raw? <string> = read_file(input, name);
+        let raw? <string> = read_file(input, name, abi);
         if (raw == null) { printf("warn: unreadable/special/symlink/NUL-containing or >4 MiB input: %s\n", name); failed++; continue; }
         let slug <string> = substr(name, 0, len(name) - 3);
         let dest <string> = concat(slug, ".html");
@@ -358,7 +358,7 @@ fun build_site(content: string, layout_dir: string, out: string, title: string) 
         let page? <string> = null;
         if (fragment != null) { page = tpl_render(layout, title, meta.title, meta.date, fragment?); free_str(fragment?); }
         let ok <bool> = false;
-        if (page != null) { ok = atomic_write(output, dest, page?); free_str(page?); }
+        if (page != null) { ok = atomic_write(output, dest, page?, abi); free_str(page?); }
         if (!ok) { printf("warn: rendering limit or publication failure: %s\n", name); failed++; }
         else {
             built++;
@@ -375,7 +375,7 @@ fun build_site(content: string, layout_dir: string, out: string, title: string) 
     if (body != null) {
         let page? <string> = tpl_render(layout, title, title, "", body?);
         free_str(body?);
-        if (page != null) { index_ok = atomic_write(output, "index.html", page?); free_str(page?); }
+        if (page != null) { index_ok = atomic_write(output, "index.html", page?, abi); free_str(page?); }
     }
     ssg_close(output); ssg_close(input); free_str(layout); free_files(&files);
     if (!index_ok) { printf("error: index rendering limit or publication failure\n"); return 1; }
@@ -385,6 +385,8 @@ fun build_site(content: string, layout_dir: string, out: string, title: string) 
 }
 
 fun main() <int> {
+    let abi <LinuxOpenFlags> = detect_linux_open_flags();
+    if (!abi.ok) { printf("error: cannot select safe Linux open flags; refusing filesystem access\n"); return 1; }
     let ap <ArgParser> = new_arg_parser("fin-ssg", "Static site generator");
     ap.add_option("--content", "-c", "content", "content directory");
     ap.add_option("--layout", "-l", "layout", "layout directory");
@@ -397,6 +399,6 @@ fun main() <int> {
     else if (!ap.parse(argv.args, argv.count)) { printf("error: %s\n", ap.error_msg); }
     else if (ap.get_positional_count() != 0) { printf("error: unexpected positional argument\n"); }
     else if (ap.get_flag("--help")) { print_usage(); result = 0; }
-    else { result = build_site(ap.get_option("--content"), ap.get_option("--layout"), ap.get_option("--out"), ap.get_option("--title")); }
+    else { result = build_site(ap.get_option("--content"), ap.get_option("--layout"), ap.get_option("--out"), ap.get_option("--title"), abi); }
     free_argv(&argv); free_arg_parser(ap); return result;
 }

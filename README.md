@@ -4,9 +4,12 @@ A static site generator CLI written in [Fin](https://github.com/M1778/Fin):
 Markdown files in, a static HTML site out. The "Fin is a real tooling
 language" demo — think a tiny Hugo.
 
-> **Verification status:** Native frontend, linking, and execution verified with
-> Fin 0.4.0 (contract 3), at both `-O0` and `-O2`. `tests/smoke.sh` includes
-> the original example assertions and security/filesystem/limit regressions.
+> **Verification status:** Native frontend, linking, and execution verified on
+> Linux x86_64 with Fin 0.4.0 (contract 3), at both `-O0` and `-O2`.
+> Linux ARM64 CI exposed architecture-specific open-flag values; runtime `uname`
+> selection and mapping tests now cover x86_64/aarch64, but the ARM64 CI rerun
+> remains pending. `tests/smoke.sh` includes the original example assertions and
+> security/filesystem/limit regressions.
 > The generator remains entirely Fin; Python 3 is used only for black-box tests.
 
 ## What it does
@@ -87,7 +90,10 @@ containing `{{content}}` stays literal and cannot introduce another substitution
 
 ## Filesystem safety and limits
 
-- Linux with mounted procfs and `statx` is required. No shell commands enumerate
+- Linux x86_64 or aarch64 with mounted procfs and `statx` is required. Runtime
+  `uname` selects architecture-specific `O_DIRECTORY`/`O_NOFOLLOW` values;
+  unknown architectures fail explicitly before filesystem access. No target
+  macros or compiled C bridge are required. No shell commands enumerate
   content; native `fs::std::walk_dir` enumerates a pinned directory descriptor.
 - Content, layout and output paths reject symlinks in **every** component and
   reject `..`. Use direct paths, not symlink aliases. Missing output parents are

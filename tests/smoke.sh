@@ -12,6 +12,9 @@ printf '%s\n' '== frontend check =='
 "$FINC" -I "$ROOT/src/vendor" "$ROOT/src/main.fin"
 printf '%s\n' "== codegen + link $OPT =="
 "$FINC" "$OPT" -I "$ROOT/src/vendor" "$ROOT/src/main.fin" -o "$WORK/fin-ssg"
+printf '%s\n' '== Linux architecture flag mappings =='
+"$FINC" "$OPT" -I "$ROOT/src/vendor" "$ROOT/tests/platform.fin" -o "$WORK/platform-test"
+"$WORK/platform-test"
 printf '%s\n' '== build the example site =='
 "$WORK/fin-ssg" --content "$ROOT/example/content" --layout "$ROOT/example/layout" \
     --out "$WORK/site" --title 'Smoke Site'
