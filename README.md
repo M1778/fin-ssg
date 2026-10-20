@@ -5,11 +5,10 @@ Markdown files in, a static HTML site out. The "Fin is a real tooling
 language" demo — think a tiny Hugo.
 
 > **Verification status:** Native frontend, linking, and execution verified on
-> Linux x86_64 with Fin 0.4.0 (contract 3), at both `-O0` and `-O2`.
-> Linux ARM64 CI exposed architecture-specific open-flag values; runtime `uname`
-> selection and mapping tests now cover x86_64/aarch64, but the ARM64 CI rerun
-> remains pending. `tests/smoke.sh` includes the original example assertions and
-> security/filesystem/limit regressions.
+> Linux x86_64 and ARM64 with Fin 0.4.0 (contract 3), at both `-O0` and `-O2`.
+> [Native run 39508662175](https://github.com/M1778/fin-sdk/actions/runs/39508662175)
+> passed this project's smoke, security, and architecture mapping suites on both
+> Linux hosts after correcting the architecture-specific open flags.
 > The generator remains entirely Fin; Python 3 is used only for black-box tests.
 
 ## What it does
