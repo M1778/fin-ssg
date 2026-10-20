@@ -1,384 +1,402 @@
-// fin-ssg — a static site generator CLI written in Fin.
-//
-// Reads Markdown files from a content directory, renders them to HTML
-// fragments with a vendored Markdown subset (src/vendor/markdown.fin),
-// wraps each page in a layout template with a vendored {{key}} engine
-// (src/vendor/template.fin), and writes the static site to an output
-// directory, plus an index.html listing every page.
-//
-// Usage:
-//   fin-ssg [--content DIR] [--layout DIR] [--out DIR] [--title TITLE]
-//
-// Markdown files may start with front matter:
-//
-//   ---
-//   title: My First Post
-//   date: 2026-10-20
-//   ---
-//
-// The layout file is <layout-dir>/page.html and may use {{site_title}},
-// {{title}}, {{date}} and {{content}}. If it is missing, a minimal
-// built-in layout is used.
-//
-// Exit codes: 0 = all pages built, 1 = usage/environment error,
-// 2 = some pages failed (warnings name each one; the rest were built).
-//
-// Design notes (Fin v0.4.0 realities):
-//   - argv arrives via /proc/self/cmdline (Linux-only), following the exact
-//     recipe in cli::std — the same @define spellings, buffer size, and
-//     NUL-segment walk. argparse::std then parses the grammar.
-//   - fs::std has no directory listing, so content/*.md is enumerated with
-//     popen("ls -1 -- '<dir>'") + fgets, the same opaque-handle @define
-//     pattern as fin-kv's kv_recv. The directory is single-quote-rejected
-//     (never interpolated raw) so no shell injection is possible.
-//   - `blame` never fires on user-controlled input: unreadable files,
-//     bad front matter and write failures become warnings + exit code 2.
-//   - Multi-file layout: src/vendor/*.fin are the canonical vendored
-//     sources, imported by name (import { md_to_html } from markdown::fin)
-//     exactly like finson/zhttp consumers do. They compile with
-//     `finc -I src/vendor src/main.fin`. If codegen ever refuses an
-//     imported Fin function body, the fallback is to inline the two vendor
-//     files into main.fin (they are dependency-free by construction).
-//   - UNVERIFIED: no working `finc` exists in this environment yet, so this
-//     file has not been through `finc` check / `-o` / run. It is written
-//     strictly against docs/agent-guide.md and the stdlib sources.
-
+// Native Fin SSG. Linux/procfs required. Content and layout files are read
+// through nofollow directory descriptors; publication is atomic per file.
 import { ArgParser, new_arg_parser, free_arg_parser } from argparse::std;
-import { is_dir, is_file, read_to_string, write_string, create_dir, free_file_content } from fs::std;
-import { len, substr, concat, equals, starts_with, ends_with, trim, index_of_char, from_chars, free_str, contains } from strings::std;
-import { md_to_html, md_escape_html } from markdown::fin;
+import { walk_dir } from fs::std;
+import { len, equals, ends_with, substr, concat, clone, to_lower, to_chars, from_chars, free_str, compare } from strings::std;
+import { TextBuffer, text_buffer, text_char, text_append, text_finish, md_to_html, md_escape_into, filename_url } from markdown::fin;
 import { tpl_render } from template::fin;
 
-// --- argv via Linux procfs (same recipe as cli::std) -----------------------
 #[llvm_name="open"]
 @define ssg_open(path: string, flags: int) <int>;
-
+#[llvm_name="openat"]
+@define ssg_openat(dir: int, path: string, flags: int, mode: int) <int>;
 #[llvm_name="read"]
 @define ssg_read(fd: int, buf: &char, count: ulong) <long>;
-
+#[llvm_name="write"]
+@define ssg_write(fd: int, buf: &char, count: ulong) <long>;
 #[llvm_name="close"]
 @define ssg_close(fd: int) <int>;
+#[llvm_name="mkdirat"]
+@define ssg_mkdirat(fd: int, path: string, mode: int) <int>;
+#[llvm_name="renameat"]
+@define ssg_renameat(old_dir: int, old: string, new_dir: int, dest: string) <int>;
+#[llvm_name="unlinkat"]
+@define ssg_unlinkat(dir: int, path: string, flags: int) <int>;
+#[llvm_name="fsync"]
+@define ssg_fsync(fd: int) <int>;
+#[llvm_name="statx"]
+@define ssg_statx(fd: int, path: string, flags: int, mask: uint, buf: &char) <int>;
+#[llvm_name="__errno_location"]
+@define ssg_errno() <&int>;
+#[llvm_name="getpid"]
+@define ssg_pid() <int>;
 
-// --- directory listing via popen (fs::std has no readdir listing) ----------
-#[llvm_name="popen"]
-@define ssg_popen(command: string, mode: string) <&void>;
-
-#[llvm_name="fgets"]
-@define ssg_fgets(buf: &char, size: int, stream: &void) <&char>;
-
-#[llvm_name="pclose"]
-@define ssg_pclose(stream: &void) <int>;
-
-const VERSION <string> = "0.1.0";
 const MAX_ARGS <int> = 256;
+const MAX_ARG_BYTES <int> = 65536;
 const MAX_FILES <int> = 4096;
-
-// ---------------------------------------------------------------------------
-// argv
-// ---------------------------------------------------------------------------
+const MAX_INPUT <int> = 4194304;
+// Linux O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC.
+const DIR_FLAGS <int> = 720896;
+// O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC.
+const READ_FLAGS <int> = 657408;
 
 struct Argv { args <[string]>, count <int>, ok <bool> }
-
-// Reads /proc/self/cmdline, skips argv[0], splits on NUL. ok=false when
-// procfs is unavailable (the caller reports it; never blame).
 fun read_argv() <Argv> {
-    let argv <Argv> = Argv{ args: new [string, MAX_ARGS]{}, count: 0, ok: false };
-    let buf <[char]> = new [char, 4096]{};
-    let fd <int> = ssg_open("/proc/self/cmdline", 0);
-    if (fd < 0) { delete buf; return argv; }
-    let got <long> = ssg_read(fd, &buf[0], cast<ulong>(4096));
+    let result <Argv> = Argv{args: new [string, MAX_ARGS]{}, count: 0, ok: false};
+    let buf <[char]> = new [char, MAX_ARG_BYTES + 1]{};
+    let fd <int> = ssg_open("/proc/self/cmdline", 524288);
+    if (fd < 0) { delete buf; return result; }
+    let used <int> = 0;
+    let good <bool> = true;
+    while (used <= MAX_ARG_BYTES) {
+        let got <long> = ssg_read(fd, &buf[used], cast<ulong>(MAX_ARG_BYTES + 1 - used));
+        if (got < cast<long>(0)) {
+            if (*ssg_errno() == 4) { continue; }
+            good = false; break;
+        }
+        if (got == cast<long>(0)) { break; }
+        used = used + cast<int>(got);
+    }
     ssg_close(fd);
-    if (got <= cast<long>(0)) { delete buf; return argv; }
-    let end <int> = cast<int>(got);
-    let skip_first <bool> = true;
+    if (!good || used == 0 || used > MAX_ARG_BYTES || buf[used - 1] != cast<char>(0)) { delete buf; return result; }
     let start <int> = 0;
-    for (let i <int> = 0; i < end; i++) {
+    let first <bool> = true;
+    for (let i <int> = 0; i < used; i++) {
         if (buf[i] == cast<char>(0)) {
-            if (i > start) {
-                if (skip_first) {
-                    skip_first = false;
-                } else if (argv.count < MAX_ARGS) {
-                    argv.args[argv.count] = from_chars(buf, start, i - start);
-                    argv.count = argv.count + 1;
-                }
+            if (first) { first = false; }
+            else {
+                if (result.count == MAX_ARGS) { delete buf; return result; }
+                let value <string> = from_chars(buf, start, i - start);
+                result.args[result.count] = value; result.count++;
             }
             start = i + 1;
         }
     }
-    delete buf;
-    argv.ok = true;
-    return argv;
+    delete buf; result.ok = true; return result;
 }
-
 fun free_argv(argv: &Argv) <noret> {
-    for (let i <int> = 0; i < argv.count; i++) {
-        free_str(argv.args[i]);
-    }
+    for (let i <int> = 0; i < argv.count; i++) { free_str(argv.args[i]); }
     delete argv.args;
 }
 
-// ---------------------------------------------------------------------------
-// content/*.md enumeration
-// ---------------------------------------------------------------------------
-
-struct FileList { files <[string]>, count <int> }
-
-// Lists *.md entries in `dir` (flat, no recursion). A single quote in the
-// directory name is rejected outright so the popen command line cannot be
-// injected through. Returns count 0 on any failure (message already printed).
-fun list_md_files(dir: string) <FileList> {
-    let out <FileList> = FileList{ files: new [string, MAX_FILES]{}, count: 0 };
-    if (contains(dir, "'")) {
-        printf("error: directory name may not contain a single quote: %s\n", dir);
-        return out;
-    }
-    let cmd <string> = concat(concat("ls -1 -- '", dir), "'");
-    let pipe <&void> = ssg_popen(cmd, "r");
-    if (pipe == null) {
-        printf("error: could not list directory %s\n", dir);
-        return out;
-    }
-    let linebuf <[char]> = new [char, 1024]{};
-    while (out.count < MAX_FILES) {
-        let got <&char> = ssg_fgets(&linebuf[0], 1024, pipe);
-        if (got == null) { break; }
-        let n <int> = 0;
-        while (n < 1024 && linebuf[n] != cast<char>(0) && linebuf[n] != cast<char>(10)) {
-            n = n + 1;
+// Walk every path component without following symlinks, including ancestors.
+// '..' is deliberately refused. The returned fd pins the final directory.
+fun open_directory(path: string, create: bool) <int> {
+    let chars <[char]> = to_chars(path);
+    let total <int> = chars.length - 1;
+    if (total == 0) { delete chars; *ssg_errno() = 22; return -1; }
+    let base <string> = ".";
+    if (chars[0] == '/') { base = "/"; }
+    let fd <int> = ssg_open(base, DIR_FLAGS);
+    let i <int> = 0;
+    while (fd >= 0 && i < total) {
+        while (i < total && chars[i] == '/') { i++; }
+        let start <int> = i;
+        while (i < total && chars[i] != '/') { i++; }
+        if (start == i) { break; }
+        let part <string> = from_chars(chars, start, i - start);
+        if (equals(part, ".")) { free_str(part); continue; }
+        if (equals(part, "..")) { free_str(part); ssg_close(fd); fd = -1; *ssg_errno() = 22; break; }
+        let next <int> = ssg_openat(fd, part, DIR_FLAGS, 0);
+        if (next < 0 && create && *ssg_errno() == 2) {
+            ssg_mkdirat(fd, part, 493);
+            next = ssg_openat(fd, part, DIR_FLAGS, 0);
         }
-        if (n == 0) { continue; }
-        let name <string> = from_chars(linebuf, 0, n);
+        free_str(part); ssg_close(fd); fd = next;
+    }
+    delete chars; return fd;
+}
+
+// statx has a stable Linux ABI: stx_mode is a 16-bit field at byte 28.
+// Returns 1 regular, 0 missing, -1 special/symlink/error. AT_EMPTY_PATH
+// validates the already-open descriptor, avoiding check/open races.
+fun regular_file(fd: int, path: string, empty: bool) <int> {
+    let bytes <[char]> = new [char, 256]{};
+    let flags <int> = 256;
+    if (empty) { flags = flags + 4096; }
+    let status <int> = ssg_statx(fd, path, flags, cast<uint>(1), &bytes[0]);
+    if (status < 0) {
+        let missing <bool> = *ssg_errno() == 2;
+        delete bytes;
+        if (missing) { return 0; }
+        return -1;
+    }
+    let mode <int> = (cast<int>(bytes[28]) & 255) + (cast<int>(bytes[29]) & 255) * 256;
+    delete bytes;
+    if ((mode & 61440) == 32768) { return 1; }
+    return -1;
+}
+
+fun? read_file(fd: int, name: string) <string> {
+    let file <int> = ssg_openat(fd, name, READ_FLAGS, 0);
+    if (file < 0) { return null; }
+    if (regular_file(file, "", true) != 1) { ssg_close(file); return null; }
+    let buf <[char]> = new [char, MAX_INPUT + 1]{};
+    let used <int> = 0;
+    let ok <bool> = true;
+    while (used <= MAX_INPUT) {
+        let got <long> = ssg_read(file, &buf[used], cast<ulong>(MAX_INPUT + 1 - used));
+        if (got < cast<long>(0)) { if (*ssg_errno() == 4) { continue; } ok = false; break; }
+        if (got == cast<long>(0)) { break; }
+        used = used + cast<int>(got);
+    }
+    if (ssg_close(file) != 0) { ok = false; }
+    if (used > MAX_INPUT) { ok = false; }
+    // NUL cannot be represented in Fin string input; never silently discard it.
+    for (let i <int> = 0; ok && i < used; i++) { if (buf[i] == cast<char>(0)) { ok = false; } }
+    if (!ok) { delete buf; return null; }
+    let text <string> = from_chars(buf, 0, used);
+    delete buf; return text;
+}
+
+// Exclusive temp creation and rename relative to the same pinned directory.
+// Reject existing special files. A raced-in symlink is replaced, never followed.
+fun atomic_write(dir: int, dest: string, text: string) <bool> {
+    if (regular_file(dir, dest, false) < 0) { return false; }
+    let temp <string> = "";
+    let fd <int> = -1;
+    for (let attempt <int> = 0; attempt < 128; attempt++) {
+        temp = format!(".fin-ssg-{}-{}.tmp", ssg_pid(), attempt);
+        // WRONLY|CREAT|EXCL|NOFOLLOW|CLOEXEC; mode 0644 respects umask.
+        fd = ssg_openat(dir, temp, 655553, 420);
+        if (fd >= 0) { break; }
+        let exists <bool> = *ssg_errno() == 17;
+        free_str(temp);
+        if (!exists) { return false; }
+    }
+    if (fd < 0) { return false; }
+    let chars <[char]> = to_chars(text);
+    let count <int> = chars.length - 1;
+    let done <int> = 0;
+    let ok <bool> = true;
+    while (done < count) {
+        let wrote <long> = ssg_write(fd, &chars[done], cast<ulong>(count - done));
+        if (wrote < cast<long>(0) && *ssg_errno() == 4) { continue; }
+        if (wrote <= cast<long>(0)) { ok = false; break; }
+        done = done + cast<int>(wrote);
+    }
+    delete chars;
+    if (ok && ssg_fsync(fd) != 0) { ok = false; }
+    if (ssg_close(fd) != 0) { ok = false; }
+    if (ok && regular_file(dir, dest, false) < 0) { ok = false; }
+    if (ok && ssg_renameat(dir, temp, dir, dest) != 0) { ok = false; }
+    if (!ok) { ssg_unlinkat(dir, temp, 0); }
+    else if (ssg_fsync(dir) != 0) { ok = false; }
+    free_str(temp); return ok;
+}
+
+struct FileList { files <[string]>, count <int>, ok <bool> }
+fun list_md_files(fd: int) <FileList> {
+    let path <string> = format!("/proc/self/fd/{}", fd);
+    let entries <[string]> = walk_dir(path);
+    free_str(path);
+    let list <FileList> = FileList{files: new [string, MAX_FILES]{}, count: 0, ok: true};
+    for (let i <int> = 0; i < entries.length; i++) {
+        let name <string> = entries[i];
+        if (name == null) { list.ok = false; continue; }
         if (ends_with(name, ".md")) {
-            out.files[out.count] = name;
-            out.count = out.count + 1;
-        } else {
-            free_str(name);
-        }
+            if (list.count == MAX_FILES) { list.ok = false; free_str(name); }
+            else { list.files[list.count] = name; list.count++; }
+        } else { free_str(name); }
     }
-    delete linebuf;
-    ssg_pclose(pipe);
-    return out;
-}
-
-fun free_file_list(fl: &FileList) <noret> {
-    for (let i <int> = 0; i < fl.count; i++) {
-        free_str(fl.files[i]);
+    delete entries;
+    // Insertion sort is bounded at 4096 filenames and preserves deterministic output.
+    for (let i <int> = 1; i < list.count; i++) {
+        let name <string> = list.files[i]; let j <int> = i;
+        while (j > 0 && compare(list.files[j - 1], name) > 0) { list.files[j] = list.files[j - 1]; j--; }
+        list.files[j] = name;
     }
-    delete fl.files;
+    return list;
 }
-
-// ---------------------------------------------------------------------------
-// front matter
-// ---------------------------------------------------------------------------
+fun free_files(list: &FileList) <noret> {
+    for (let i <int> = 0; i < list.count; i++) { free_str(list.files[i]); }
+    delete list.files;
+}
 
 struct PageMeta { title <string>, date <string>, body <string> }
-
-// Splits "---\ntitle: ..\ndate: ..\n---\n<body>" into its parts. No opening
-// fence, or no closing fence, means "no front matter": the whole text is the
-// body and the title falls back to `fallback_title`.
-fun parse_front_matter(text: string, fallback_title: string) <PageMeta> {
-    let meta <PageMeta> = PageMeta{ title: fallback_title, date: "", body: text };
-    if (!starts_with(text, "---\n")) { return meta; }
-    let rest <string> = substr(text, 4, len(text) - 4);
-    let total <int> = len(rest);
-    let fm <string> = "";
-    let closed <bool> = false;
-    let body_start <int> = total;
-    let i <int> = 0;
+fun blank(c: char) <bool> { return c == ' ' || c == '\t' || c == '\r'; }
+fun parse_front_matter(text: string, fallback: string) <PageMeta> {
+    let meta <PageMeta> = PageMeta{title: clone(fallback), date: clone(""), body: clone(text)};
+    let chars <[char]> = to_chars(text);
+    let total <int> = chars.length - 1;
+    let first <int> = 0;
+    while (first < total && chars[first] != '\n') { first++; }
+    let opening <int> = first;
+    if (opening > 0 && chars[opening - 1] == '\r') { opening--; }
+    if (opening != 3 || chars[0] != '-' || chars[1] != '-' || chars[2] != '-' || first == total) { delete chars; return meta; }
+    let close <int> = -1;
+    let body <int> = total;
+    let i <int> = first + 1;
     while (i < total) {
-        let nl <int> = index_of_char(substr(rest, i, total - i), '\n');
-        let line_end <int> = total;
-        if (nl >= 0) { line_end = i + nl; }
-        let line <string> = trim(substr(rest, i, line_end - i));
-        if (equals(line, "---")) {
-            closed = true;
-            if (nl >= 0) { body_start = line_end + 1; }
-            break;
+        let end <int> = i;
+        while (end < total && chars[end] != '\n') { end++; }
+        let left <int> = i; let right <int> = end;
+        while (left < right && blank(chars[left])) { left++; }
+        while (right > left && blank(chars[right - 1])) { right--; }
+        if (right - left == 3 && chars[left] == '-' && chars[left + 1] == '-' && chars[left + 2] == '-') { close = i; body = end; if (body < total) { body++; } break; }
+        i = end + 1;
+    }
+    if (close < 0) { delete chars; return meta; }
+    i = first + 1;
+    while (i < close) {
+        let end <int> = i;
+        while (end < close && chars[end] != '\n') { end++; }
+        let colon <int> = i;
+        while (colon < end && chars[colon] != ':') { colon++; }
+        if (colon < end) {
+            let left <int> = i; let right <int> = colon;
+            while (left < right && blank(chars[left])) { left++; }
+            while (right > left && blank(chars[right - 1])) { right--; }
+            let key <string> = from_chars(chars, left, right - left);
+            left = colon + 1; right = end;
+            while (left < right && blank(chars[left])) { left++; }
+            while (right > left && blank(chars[right - 1])) { right--; }
+            if (equals(key, "title")) { free_str(meta.title); meta.title = from_chars(chars, left, right - left); }
+            else if (equals(key, "date")) { free_str(meta.date); meta.date = from_chars(chars, left, right - left); }
+            free_str(key);
         }
-        fm = concat(fm, concat(line, "\n"));
-        if (nl < 0) { break; }
-        i = line_end + 1;
+        i = end + 1;
     }
-    if (!closed) { return meta; }
-    // Parse "key: value" lines.
-    let f <string> = fm;
-    while (true) {
-        let nl2 <int> = index_of_char(f, '\n');
-        if (nl2 < 0) { break; }
-        let fl <string> = substr(f, 0, nl2);
-        f = substr(f, nl2 + 1, len(f) - nl2 - 1);
-        let colon <int> = index_of_char(fl, ':');
-        if (colon > 0) {
-            let key <string> = trim(substr(fl, 0, colon));
-            let val <string> = trim(substr(fl, colon + 1, len(fl) - colon - 1));
-            if (equals(key, "title")) { meta.title = val; }
-            if (equals(key, "date")) { meta.date = val; }
-        }
-    }
-    meta.body = substr(rest, body_start, total - body_start);
-    return meta;
+    free_str(meta.body); meta.body = from_chars(chars, body, total - body);
+    delete chars; return meta;
 }
-
-// "hello.md" -> "hello" (the .md suffix is the only thing stripped;
-// filenames are otherwise used verbatim, so keep them URL-safe).
-fun slug_of(filename: string) <string> {
-    if (ends_with(filename, ".md")) {
-        return substr(filename, 0, len(filename) - 3);
-    }
-    return filename;
-}
-
-// ---------------------------------------------------------------------------
-// layout
-// ---------------------------------------------------------------------------
-
+fun free_meta(meta: &PageMeta) <noret> { free_str(meta.title); free_str(meta.date); free_str(meta.body); }
 fun default_layout() <string> {
     return "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{{title}} &mdash; {{site_title}}</title>\n<style>body{max-width:42rem;margin:2rem auto;padding:0 1rem;font-family:system-ui,sans-serif;line-height:1.6}pre{background:#f4f4f4;padding:1rem;overflow:auto}code{background:#f4f4f4;padding:.1rem .3rem}pre code{background:none;padding:0}img{max-width:100%}blockquote{border-left:3px solid #ccc;margin-left:0;padding-left:1rem;color:#555}</style>\n</head>\n<body>\n<main>\n{{content}}\n</main>\n</body>\n</html>\n";
 }
-
 fun print_usage() <noret> {
-    printf("fin-ssg v%s — static site generator: Markdown in, HTML out.\n\n", VERSION);
-    printf("usage: fin-ssg [--content DIR] [--layout DIR] [--out DIR] [--title TITLE]\n\n");
-    printf("  --content, -c   content directory with .md files (default: content)\n");
-    printf("  --layout, -l    layout directory holding page.html (default: layout)\n");
-    printf("  --out, -o       output directory for the HTML files (default: public)\n");
-    printf("  --title, -t     site title, used in <title> and index.html (default: My Site)\n");
-    printf("  --help, -h      show this help and exit\n\n");
-    printf("page.html may use {{site_title}}, {{title}}, {{date}} and {{content}}.\n");
-    printf("A Markdown file may start with --- front matter:\n");
-    printf("  ---\n  title: My First Post\n  date: 2026-10-20\n  ---\n");
+    printf("fin-ssg v0.1.0 — native Fin static site generator\n");
+    printf("usage: fin-ssg [--content DIR] [--layout DIR] [--out DIR] [--title TITLE]\n");
+    printf("Aliases: -c, -l, -o, -t; --help/-h. Defaults: content, layout, public, My Site.\n");
+    printf("Limits: 256 arguments / 65536 argv bytes, 4096 Markdown files, 4 MiB per input, 32 MiB per rendered output.\n");
+    printf("Linux/procfs/statx required; symlink paths and '..' components refused. Layouts are trusted HTML.\n");
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
-
-struct BuiltPage { slug <string>, title <string>, date <string> }
-
-fun main() <int> {
-    let ap <ArgParser> = new_arg_parser("fin-ssg", "Static site generator: Markdown in, HTML out.");
-    ap.add_option("--content", "-c", "content", "content directory with .md files");
-    ap.add_option("--layout", "-l", "layout", "layout directory holding page.html");
-    ap.add_option("--out", "-o", "public", "output directory for the HTML files");
-    ap.add_option("--title", "-t", "My Site", "site title for <title> and index.html");
-    ap.add_flag("--help", "-h", "show this help and exit");
-
-    let argv <Argv> = read_argv();
-    if (!argv.ok) {
-        printf("error: cannot read /proc/self/cmdline (Linux procfs required)\n");
-        return 1;
+// Reserve the generated homepage and reject ASCII case-folded collisions so
+// output remains portable to case-insensitive filesystems and static hosts.
+fun safe_names(files: &FileList) <bool> {
+    let keys <[string]> = new [string, files.count]{};
+    let ok <bool> = true;
+    for (let i <int> = 0; i < files.count; i++) {
+        let key <string> = to_lower(files.files[i]);
+        keys[i] = key;
+        if (equals(keys[i], "index.md")) { ok = false; }
     }
-    if (!ap.parse(argv.args, argv.count)) {
-        printf("error: %s\n\n", ap.error_msg);
-        print_usage();
-        free_argv(&argv);
-        free_arg_parser(ap);
-        return 1;
+    for (let i <int> = 1; i < files.count; i++) {
+        let key <string> = keys[i]; let j <int> = i;
+        while (j > 0 && compare(keys[j - 1], key) > 0) { keys[j] = keys[j - 1]; j--; }
+        keys[j] = key;
     }
-    if (ap.get_flag("--help")) {
-        print_usage();
-        free_argv(&argv);
-        free_arg_parser(ap);
-        return 0;
+    for (let i <int> = 1; i < files.count; i++) {
+        if (equals(keys[i - 1], keys[i])) { ok = false; }
     }
-    let content_dir <string> = ap.get_option("--content");
-    let layout_dir <string> = ap.get_option("--layout");
-    let out_dir <string> = ap.get_option("--out");
-    let site_title <string> = ap.get_option("--title");
+    for (let i <int> = 0; i < files.count; i++) { free_str(keys[i]); }
+    delete keys;
+    return ok;
+}
 
-    if (!is_dir(content_dir)) {
-        printf("error: content directory not found: %s\n", content_dir);
-        free_argv(&argv);
-        free_arg_parser(ap);
-        return 1;
+fun build_site(content: string, layout_dir: string, out: string, title: string) <int> {
+    let input <int> = open_directory(content, false);
+    if (input < 0) { printf("error: content must be a readable, non-symlink directory: %s\n", content); return 1; }
+    let files <FileList> = list_md_files(input);
+    if (!files.ok || files.count == 0) {
+        printf("error: content listing failed, is empty, or exceeds 4096 Markdown files\n");
+        free_files(&files); ssg_close(input); return 1;
     }
-
-    let layout_path <string> = concat(concat(layout_dir, "/"), "page.html");
-    let layout <string> = default_layout();
-    if (is_file(layout_path)) {
-        let lt? <string> = read_to_string(layout_path);
-        if (lt == null) {
-            printf("warn: could not read %s; using the built-in layout\n", layout_path);
-        } else {
-            // The file buffer becomes the layout; it outlives this scope,
-            // so it is intentionally not freed (short-lived CLI).
-            layout = lt?;
+    // Preflight all reserved names before making any output changes.
+    if (!safe_names(&files)) {
+        printf("error: index.md is reserved; output names must be unique ignoring ASCII case\n");
+        free_files(&files); ssg_close(input); return 1;
+    }
+    let layout <string> = clone(default_layout());
+    let layout_fd <int> = open_directory(layout_dir, false);
+    let layout_error <bool> = false;
+    if (layout_fd < 0) {
+        if (*ssg_errno() != 2) { layout_error = true; }
+    } else {
+        let state <int> = regular_file(layout_fd, "page.html", false);
+        if (state < 0) { layout_error = true; }
+        else if (state == 1) {
+            let value? <string> = read_file(layout_fd, "page.html");
+            if (value == null) { layout_error = true; }
+            else { free_str(layout); layout = value?; }
         }
+        ssg_close(layout_fd);
     }
-
-    let files <FileList> = list_md_files(content_dir);
-    if (files.count == 0) {
-        printf("error: no .md files found in %s\n", content_dir);
-        free_file_list(&files);
-        free_argv(&argv);
-        free_arg_parser(ap);
-        return 1;
+    if (layout_error) {
+        printf("error: unsafe/unreadable layout or input exceeds 4 MiB\n");
+        free_str(layout); free_files(&files); ssg_close(input); return 1;
     }
-
-    if (!is_dir(out_dir)) {
-        if (!create_dir(out_dir)) {
-            printf("error: could not create output directory %s\n", out_dir);
-            free_file_list(&files);
-            free_argv(&argv);
-            free_arg_parser(ap);
-            return 1;
-        }
+    let output <int> = open_directory(out, true);
+    if (output < 0) {
+        printf("error: cannot open/create non-symlink output directory: %s\n", out);
+        free_str(layout); free_files(&files); ssg_close(input); return 1;
     }
-
-    let built <[BuiltPage]> = new [BuiltPage, MAX_FILES]{};
-    let built_n <int> = 0;
-    let failed <int> = 0;
+    let safe <bool> = regular_file(output, "index.html", false) >= 0;
+    for (let i <int> = 0; safe && i < files.count; i++) {
+        let slug <string> = substr(files.files[i], 0, len(files.files[i]) - 3);
+        let dest <string> = concat(slug, ".html");
+        if (regular_file(output, dest, false) < 0) { printf("error: unsafe output file: %s\n", dest); safe = false; }
+        free_str(dest); free_str(slug);
+    }
+    if (!safe) {
+        printf("error: output preflight refused a symlink/special file\n");
+        ssg_close(output); free_str(layout); free_files(&files); ssg_close(input); return 1;
+    }
+    let index <TextBuffer> = text_buffer();
+    text_append(&index, "<h1>"); md_escape_into(&index, title); text_append(&index, "</h1>\n<ul>\n");
+    let built <int> = 0; let failed <int> = 0;
     for (let i <int> = 0; i < files.count; i++) {
         let name <string> = files.files[i];
-        let src <string> = concat(concat(content_dir, "/"), name);
-        let raw? <string> = read_to_string(src);
-        if (raw == null) {
-            printf("warn: skipping unreadable file %s\n", src);
-            failed = failed + 1;
-            continue;
+        let raw? <string> = read_file(input, name);
+        if (raw == null) { printf("warn: unreadable/special/symlink/NUL-containing or >4 MiB input: %s\n", name); failed++; continue; }
+        let slug <string> = substr(name, 0, len(name) - 3);
+        let dest <string> = concat(slug, ".html");
+        let meta <PageMeta> = parse_front_matter(raw?, slug);
+        free_str(raw?);
+        let fragment? <string> = md_to_html(meta.body);
+        let page? <string> = null;
+        if (fragment != null) { page = tpl_render(layout, title, meta.title, meta.date, fragment?); free_str(fragment?); }
+        let ok <bool> = false;
+        if (page != null) { ok = atomic_write(output, dest, page?); free_str(page?); }
+        if (!ok) { printf("warn: rendering limit or publication failure: %s\n", name); failed++; }
+        else {
+            built++;
+            text_append(&index, "<li><a href=\""); filename_url(&index, dest); text_append(&index, "\">"); md_escape_into(&index, meta.title); text_append(&index, "</a>");
+            if (len(meta.date) > 0) { text_append(&index, " <span class=\"date\">"); md_escape_into(&index, meta.date); text_append(&index, "</span>"); }
+            text_append(&index, "</li>\n");
+            printf("built %s -> %s\n", name, dest);
         }
-        let text <string> = raw?;
-        let slug <string> = slug_of(name);
-        let meta <PageMeta> = parse_front_matter(text, slug);
-        let html_body <string> = md_to_html(meta.body);
-        let page <string> = tpl_render(layout, md_escape_html(site_title), md_escape_html(meta.title), md_escape_html(meta.date), html_body);
-        let dest <string> = concat(concat(concat(out_dir, "/"), slug), ".html");
-        if (!write_string(dest, page)) {
-            printf("warn: could not write %s\n", dest);
-            failed = failed + 1;
-        } else {
-            built[built_n] = BuiltPage{ slug: slug, title: meta.title, date: meta.date };
-            built_n = built_n + 1;
-            printf("built %s -> %s\n", src, dest);
-        }
-        free_file_content(raw);
+        free_meta(&meta); free_str(dest); free_str(slug);
     }
-
-    // index.html: one link per built page.
-    let items <string> = "";
-    for (let j <int> = 0; j < built_n; j++) {
-        let li <string> = concat("<li><a href=\"", concat(built[j].slug, concat(".html\">", concat(md_escape_html(built[j].title), "</a>"))));
-        if (!equals(built[j].date, "")) {
-            li = concat(li, concat(" <span class=\"date\">", concat(md_escape_html(built[j].date), "</span>")));
-        }
-        items = concat(items, concat(li, "</li>\n"));
+    text_append(&index, "</ul>\n");
+    let body? <string> = text_finish(&index);
+    let index_ok <bool> = false;
+    if (body != null) {
+        let page? <string> = tpl_render(layout, title, title, "", body?);
+        free_str(body?);
+        if (page != null) { index_ok = atomic_write(output, "index.html", page?); free_str(page?); }
     }
-    let index_body <string> = concat(concat("<h1>", md_escape_html(site_title)), concat("</h1>\n<ul>\n", concat(items, "</ul>\n")));
-    let index_page <string> = tpl_render(layout, md_escape_html(site_title), md_escape_html(site_title), "", index_body);
-    let index_dest <string> = concat(out_dir, "/index.html");
-    if (!write_string(index_dest, index_page)) {
-        printf("error: could not write %s\n", index_dest);
-        free_file_list(&files);
-        free_argv(&argv);
-        free_arg_parser(ap);
-        return 1;
-    }
-
-    printf("fin-ssg: %d page(s) + index -> %s/ (%d skipped)\n", built_n, out_dir, failed);
-    delete built;
-    free_file_list(&files);
-    free_argv(&argv);
-    free_arg_parser(ap);
+    ssg_close(output); ssg_close(input); free_str(layout); free_files(&files);
+    if (!index_ok) { printf("error: index rendering limit or publication failure\n"); return 1; }
+    printf("fin-ssg: %d page(s) + index -> %s/ (%d skipped)\n", built, out, failed);
     if (failed > 0) { return 2; }
     return 0;
+}
+
+fun main() <int> {
+    let ap <ArgParser> = new_arg_parser("fin-ssg", "Static site generator");
+    ap.add_option("--content", "-c", "content", "content directory");
+    ap.add_option("--layout", "-l", "layout", "layout directory");
+    ap.add_option("--out", "-o", "public", "output directory");
+    ap.add_option("--title", "-t", "My Site", "site title");
+    ap.add_flag("--help", "-h", "show help");
+    let argv <Argv> = read_argv();
+    let result <int> = 1;
+    if (!argv.ok) { printf("error: cannot read complete argv (Linux procfs; max 256 args / 65536 bytes)\n"); }
+    else if (!ap.parse(argv.args, argv.count)) { printf("error: %s\n", ap.error_msg); }
+    else if (ap.get_positional_count() != 0) { printf("error: unexpected positional argument\n"); }
+    else if (ap.get_flag("--help")) { print_usage(); result = 0; }
+    else { result = build_site(ap.get_option("--content"), ap.get_option("--layout"), ap.get_option("--out"), ap.get_option("--title")); }
+    free_argv(&argv); free_arg_parser(ap); return result;
 }

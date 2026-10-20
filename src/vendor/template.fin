@@ -1,27 +1,38 @@
-// VENDORED — replace with fin-template (Builder #2's HTML templating
-// engine) when available.
-//
-// Minimal {{key}} substitution for fin-ssg layouts. Supported keys:
-//   {{site_title}}  the --title value, for <title> and the index page
-//   {{title}}       the page title (front matter, else the file slug)
-//   {{date}}        the page date (front matter, else "")
-//   {{content}}     the rendered page HTML fragment
-// Unknown {{...}} placeholders are left untouched.
-//
-// Values are inserted as-is: page HTML is already escaped by the Markdown
-// renderer, and fin-ssg escapes title/date itself before calling tpl_render.
-// The real fin-template will add {% if %}/{% for %}/filters/inheritance —
-// until then, layouts are static shells with four slots.
-
-import { replace } from strings::std;
-
+// VENDORED — single-pass {{key}} rendering. Inserted values are never parsed.
+// Metadata is escaped for text/quoted-attribute contexts; content is trusted
+// renderer output. Layout files themselves must be trusted HTML, not user input.
+import { to_chars } from strings::std;
+import { TextBuffer, text_buffer, text_char, text_append, text_range, text_finish, md_escape_into } from markdown::fin;
 namespace fin {
-
-pub fun tpl_render(tpl: string, site_title: string, title: string, date: string, content: string) <string> {
-    let o <string> = replace(tpl, "{{site_title}}", site_title);
-    let o2 <string> = replace(o, "{{title}}", title);
-    let o3 <string> = replace(o2, "{{date}}", date);
-    return replace(o3, "{{content}}", content);
+fun tpl_key(chars: [char], start: int, end: int, key: string) <bool> {
+    let token <[char]> = to_chars(key);
+    let same <bool> = end - start == token.length - 1;
+    for (let i <int> = 0; same && i < token.length - 1; i++) {
+        if (chars[start + i] != token[i]) { same = false; }
+    }
+    delete token;
+    return same;
 }
 
+pub fun? tpl_render(tpl: string, site_title: string, title: string, date: string, content: string) <string> {
+    let chars <[char]> = to_chars(tpl);
+    let total <int> = chars.length - 1;
+    let out <TextBuffer> = text_buffer();
+    let i <int> = 0;
+    while (i < total && out.ok) {
+        if (i + 1 < total && chars[i] == '{' && chars[i + 1] == '{') {
+            let close <int> = i + 2;
+            while (close + 1 < total && !(chars[close] == '}' && chars[close + 1] == '}')) { close++; }
+            if (close + 1 >= total) { text_range(&out, chars, i, total); break; }
+            if (tpl_key(chars, i + 2, close, "site_title")) { md_escape_into(&out, site_title); }
+            else if (tpl_key(chars, i + 2, close, "title")) { md_escape_into(&out, title); }
+            else if (tpl_key(chars, i + 2, close, "date")) { md_escape_into(&out, date); }
+            else if (tpl_key(chars, i + 2, close, "content")) { text_append(&out, content); }
+            else { text_range(&out, chars, i, close + 2); }
+            i = close + 2;
+        } else { text_char(&out, chars[i]); i++; }
+    }
+    delete chars;
+    return text_finish(&out);
+}
 }

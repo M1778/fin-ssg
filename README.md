@@ -4,10 +4,10 @@ A static site generator CLI written in [Fin](https://github.com/M1778/Fin):
 Markdown files in, a static HTML site out. The "Fin is a real tooling
 language" demo — think a tiny Hugo.
 
-> **Verification status:** UNVERIFIED — written strictly against the Fin
-> v0.4.0 [agent guide](https://github.com/M1778/Fin/blob/master/docs/agent-guide.md)
-> and the stdlib sources. No working `finc` exists in the dev environment yet;
-> the first thing to do when one appears is `sh tests/smoke.sh`.
+> **Verification status:** Native frontend, linking, and execution verified with
+> Fin 0.4.0 (contract 3), at both `-O0` and `-O2`. `tests/smoke.sh` includes
+> the original example assertions and security/filesystem/limit regressions.
+> The generator remains entirely Fin; Python 3 is used only for black-box tests.
 
 ## What it does
 
@@ -72,12 +72,50 @@ Block: `#`/`##`/`###` headings, paragraphs, fenced code blocks
 (\`\`\`), `-`/`*` unordered lists, `1.` ordered lists, `>` blockquotes,
 `---` horizontal rules.
 Inline: \`code\`, `**bold**`, `*italic*`, `[text](url)`, `![alt](url)`.
-All text is HTML-escaped.
+All text and quoted attributes are HTML-escaped. Links allow `http`, `https`,
+`mailto`, and relative URLs; images allow `http`, `https`, and relative URLs.
+Unsafe schemes, control characters, scheme entity obfuscation, protocol-relative
+URLs, and encoded structural/control bytes degrade to literal Markdown.
+Percent-encoded spaces in relative paths remain supported. Filenames are
+URL-encoded in the index, including quotes, spaces, Unicode and newlines.
 
 Not supported yet (degrade to literal text, never abort): nested lists,
 tables, reference links, setext headings, headings deeper than `###`,
-multi-line quote merging, recursive content directories, filenames with
-newlines. These are the natural issues to file once `fin-markdown` exists.
+multi-line quote merging, recursive content directories. Inline nesting beyond
+16 levels becomes literal text. Layout substitutions are single-pass: metadata
+containing `{{content}}` stays literal and cannot introduce another substitution.
+
+## Filesystem safety and limits
+
+- Linux with mounted procfs and `statx` is required. No shell commands enumerate
+  content; native `fs::std::walk_dir` enumerates a pinned directory descriptor.
+- Content, layout and output paths reject symlinks in **every** component and
+  reject `..`. Use direct paths, not symlink aliases. Missing output parents are
+  created. Missing layouts use the default; unsafe/unreadable layouts fail.
+- Only regular input files are read. Symlinks, FIFOs, embedded NUL bytes and
+  files larger than 4 MiB are reported, not silently shortened.
+- `index.md` (any ASCII case) is reserved; ASCII case-folded output-name
+  collisions are rejected before publication. Existing output
+  symlinks, directories and other special files fail preflight. Regular files
+  are replaced through exclusive same-directory temporary files, checked writes,
+  `fsync`, close and descriptor-relative rename. Existing hardlinks are replaced,
+  not truncated. Atomicity is **per file**, not an all-or-nothing site transaction;
+  partial successes remain on a later failure. No stale-output cleanup is done.
+- Limits: 256 arguments / 65,536 total argv bytes (including executable name),
+  4,096 Markdown files, 4 MiB per input/layout, 32 MiB per rendered output/index.
+  Limits fail explicitly. There is no line-count limit; empty option values and
+  quoted directory names are preserved. Input directories must remain stable
+  during enumeration; concurrent addition/removal is not a supported snapshot.
+- Layouts are trusted HTML. Place metadata only in text or quoted attributes,
+  not executable JavaScript/CSS or URL-valued attributes; use `{{content}}` only
+  in an HTML body context. The tool does not sanitize arbitrary layout HTML.
+  Keep the output directory owned by the build user, not writable by adversaries.
+- Known toolchain limitation: O0 can evaluate an allocating indexed-assignment
+  RHS twice. This repository uses local temporaries before owned-array assignment,
+  but the pinned native `fs::std::walk_dir` still contains such an assignment;
+  directory enumeration can therefore leak a duplicated filename allocation.
+  Compiler/stdlib fixes are outside this repository; this is not a claim of
+  fully leak-free O0 execution.
 
 ## Vendored code
 
@@ -85,20 +123,27 @@ newlines. These are the natural issues to file once `fin-markdown` exists.
 scaffold, not a templating engine — so both are hand-rolled inside this
 repo and clearly marked:
 
-- `src/vendor/markdown.fin` — `// VENDORED — replace with fin-markdown when available`
-- `src/vendor/template.fin` — `// VENDORED — replace with fin-template (Builder #2) when available`
+- `src/vendor/markdown.fin` — native Fin Markdown parsing, URL checks, escaping,
+  and bounded amortized text buffers.
+- `src/vendor/template.fin` — native Fin single-pass four-slot template engine.
 
-They are imported by name (`import { md_to_html } from markdown::fin`),
-the same spelling verified Fin libraries (finson, zhttp) use. If codegen
-ever refuses an imported Fin function body, the documented fallback is to
-inline the two files into `src/main.fin` — they are dependency-free by
-construction, so the move is mechanical.
+Both are imported by name (`import { md_to_html } from markdown::fin`) and
+compile through the native backend. Returned renderer strings are explicitly
+owned and released after each page.
 
 ## Tests & CI
 
 ```sh
-sh tests/smoke.sh   # frontend check + build + example site + HTML assertions
+sh tests/smoke.sh   # frontend + native build + examples + security regressions
+OPT=-O2 sh tests/smoke.sh
+# Override compiler/library paths if needed:
+FINC=/path/to/finc FIN_LIBS=/path/to/lib/std sh tests/smoke.sh
 ```
+
+The regression benchmark renders **20,001 lines** (10,000 `line`/blank pairs
+plus a tail sentinel), preserving the tail. Observed wall times on the test host
+were approximately 0.011 s at O0 and 0.007 s at O2; these are illustrative local
+measurements, not portable performance thresholds.
 
 `.github/workflows/ci.yml` installs the Fin toolchain, runs the frontend
 check, builds the binary, and runs the smoke test on every push/PR.
