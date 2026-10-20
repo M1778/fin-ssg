@@ -1,0 +1,17 @@
+# finn.toml — REAL format per github.com/M1778/finn (README, 2026-10-19).
+# Layout: finn.toml, src/main.fin, src/vendor/*.fin, tests/, .finn/packages/.
+[project]
+name = "fin-ssg"
+version = "0.1.0"
+envpath = ".finn"
+entrypoint = "main.fin"
+
+# fin-markdown does not exist yet and M1778/template is a project scaffold,
+# not a templating engine — so the Markdown renderer and the {{key}} template
+# engine are vendored under src/vendor/ (marked for replacement). No
+# [packages] until the real libraries land.
+
+[scripts]
+check = "finc -I src/vendor src/main.fin"
+build = "finc -I src/vendor src/main.fin -o fin-ssg"
+smoke = "sh tests/smoke.sh"

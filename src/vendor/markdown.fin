@@ -1,0 +1,360 @@
+// VENDORED — replace with fin-markdown when available.
+//
+// Minimal Markdown → HTML renderer for fin-ssg (v0.1). Block subset:
+//   ATX headings (#, ##, ###), paragraphs, fenced code blocks (```),
+//   unordered lists (-, *), ordered lists (1.), blockquotes (>),
+//   horizontal rules (---), blank-line separation.
+// Inline subset: `code`, **bold**, *italic*, [links](url), ![images](url).
+//
+// Deliberately NOT supported yet: nested lists, tables, setext headings,
+// reference links, headings deeper than ### (#### falls back to paragraph),
+// multi-line quote merging (each `>` line becomes its own <p>).
+//
+// All text is HTML-escaped; code spans and fences are escaped but never
+// inline-processed. Malformed markup degrades to literal text — nothing here
+// aborts (no `blame`): the input is user-authored content.
+
+import { len, find, substr, concat, equals, starts_with, ends_with, trim, index_of_char, is_numeric, free_str, replace } from strings::std;
+
+namespace fin {
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+// Absolute index of `needle` in `s` at or after `start`, or -1.
+fun md_find_from_i(s: string, needle: string, start: int) <int> {
+    if (start < 0) { start = 0; }
+    let total <int> = len(s);
+    if (start >= total) { return -1; }
+    let rel <int> = find(substr(s, start, total - start), needle);
+    if (rel < 0) { return -1; }
+    return start + rel;
+}
+
+// s with the span [from, to_excl) replaced by rep.
+fun md_replace_span(s: string, from_idx: int, to_excl: int, rep: string) <string> {
+    return concat(concat(substr(s, 0, from_idx), rep), substr(s, to_excl, len(s) - to_excl));
+}
+
+// index_of_char at or after `start`, or -1.
+fun md_index_from(s: string, c: char, start: int) <int> {
+    if (start < 0) { start = 0; }
+    let total <int> = len(s);
+    if (start >= total) { return -1; }
+    let rel <int> = index_of_char(substr(s, start, total - start), c);
+    if (rel < 0) { return -1; }
+    return start + rel;
+}
+
+// ---------------------------------------------------------------------------
+// HTML escaping
+// ---------------------------------------------------------------------------
+
+// Escape &, <, > (ampersand first so we never double-escape).
+pub fun md_escape_html(s: string) <string> {
+    let e <string> = replace(s, "&", "&amp;");
+    let e2 <string> = replace(e, "<", "&lt;");
+    return replace(e2, ">", "&gt;");
+}
+
+// ---------------------------------------------------------------------------
+// Inline rendering
+// ---------------------------------------------------------------------------
+
+fun md_expand_images(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "![", pos);
+        if (a < 0) { break; }
+        let m <int> = md_find_from_i(out, "](", a + 2);
+        if (m < 0) { break; }
+        let b <int> = md_find_from_i(out, ")", m + 2);
+        if (b < 0) { break; }
+        let alt <string> = substr(out, a + 2, m - a - 2);
+        let url <string> = substr(out, m + 2, b - m - 2);
+        let rep <string> = concat("<img src=\"", concat(url, concat("\" alt=\"", concat(alt, "\">"))));
+        out = md_replace_span(out, a, b + 1, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_links(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "[", pos);
+        if (a < 0) { break; }
+        // A leftover image marker (unparseable) is not a link.
+        if (a > 0 && equals(substr(out, a - 1, 1), "!")) { pos = a + 1; continue; }
+        let m <int> = md_find_from_i(out, "](", a + 1);
+        if (m < 0) { pos = a + 1; continue; }
+        let b <int> = md_find_from_i(out, ")", m + 2);
+        if (b < 0) { break; }
+        let text <string> = substr(out, a + 1, m - a - 1);
+        let url <string> = substr(out, m + 2, b - m - 2);
+        let rep <string> = concat("<a href=\"", concat(url, concat("\">", concat(text, "</a>"))));
+        out = md_replace_span(out, a, b + 1, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_bold(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "**", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_from_i(out, "**", a + 2);
+        if (b < 0) { break; }
+        if (b == a + 2) { pos = a + 2; continue; }  // "****": not a bold span
+        let inner <string> = substr(out, a + 2, b - a - 2);
+        let rep <string> = concat("<strong>", concat(inner, "</strong>"));
+        out = md_replace_span(out, a, b + 2, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_italic(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "*", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_from_i(out, "*", a + 1);
+        if (b < 0) { break; }
+        if (b == a + 1) { pos = a + 1; continue; }  // "**" remnant: not italic
+        let inner <string> = substr(out, a + 1, b - a - 1);
+        let rep <string> = concat("<em>", concat(inner, "</em>"));
+        out = md_replace_span(out, a, b + 1, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+// Inline rendering for normal text: escape first, then expand markup.
+// (Code spans are extracted by the caller before this runs.)
+fun md_inline_text(s: string) <string> {
+    let e <string> = md_escape_html(s);
+    let e2 <string> = md_expand_images(e);
+    let e3 <string> = md_expand_links(e2);
+    let e4 <string> = md_expand_bold(e3);
+    return md_expand_italic(e4);
+}
+
+// Full inline pass: `code` spans are escaped literally, everything else
+// goes through md_inline_text. An unclosed backtick is literal text.
+pub fun md_inline(s: string) <string> {
+    let out <string> = "";
+    let rest <string> = s;
+    let in_code <bool> = false;
+    while (true) {
+        let bt <int> = find(rest, "`");
+        if (bt < 0) {
+            if (in_code) { out = concat(out, "`"); }  // unclosed: literal
+            out = concat(out, md_inline_text(rest));
+            break;
+        }
+        let part <string> = substr(rest, 0, bt);
+        if (in_code) {
+            out = concat(out, concat("<code>", concat(md_escape_html(part), "</code>")));
+        } else {
+            out = concat(out, md_inline_text(part));
+        }
+        in_code = !in_code;
+        rest = substr(rest, bt + 1, len(rest) - bt - 1);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Block rendering
+// ---------------------------------------------------------------------------
+
+// Writer state threaded through the block loop.
+struct MDState {
+    html <string>,
+    in_code <bool>,
+    in_ul <bool>,
+    in_ol <bool>,
+    in_quote <bool>,
+    para <string>,
+    para_open <bool>
+}
+
+fun md_close_para(st: &MDState) <noret> {
+    if (st.para_open) {
+        st.html = concat(st.html, concat("<p>", concat(md_inline(st.para), "</p>\n")));
+        st.para = "";
+        st.para_open = false;
+    }
+}
+
+fun md_close_lists(st: &MDState) <noret> {
+    if (st.in_ul) { st.html = concat(st.html, "</ul>\n"); st.in_ul = false; }
+    if (st.in_ol) { st.html = concat(st.html, "</ol>\n"); st.in_ol = false; }
+}
+
+fun md_close_quote(st: &MDState) <noret> {
+    if (st.in_quote) { st.html = concat(st.html, "</blockquote>\n"); st.in_quote = false; }
+}
+
+fun md_close_all(st: &MDState) <noret> {
+    md_close_para(st);
+    md_close_lists(st);
+    md_close_quote(st);
+}
+
+// Split s into lines (handles \n and \r\n), up to `cap`. Returns the count;
+// lines land in out[0..count).
+fun md_split_lines(s: string, out: [string], cap: int) <int> {
+    let count <int> = 0;
+    let rest <string> = s;
+    while (count < cap) {
+        let nl <int> = index_of_char(rest, '\n');
+        let line_end <int> = len(rest);
+        if (nl >= 0) { line_end = nl; }
+        let line <string> = substr(rest, 0, line_end);
+        if (ends_with(line, "\r")) { line = substr(line, 0, len(line) - 1); }
+        out[count] = line;
+        count = count + 1;
+        if (nl < 0) { break; }
+        rest = substr(rest, nl + 1, len(rest) - nl - 1);
+    }
+    return count;
+}
+
+// ATX heading level (1-3) when t is "# "+text, else 0.
+// Requires the space after the #'s (CommonMark rule).
+fun md_heading_level(t: string) <int> {
+    let total <int> = len(t);
+    let level <int> = 0;
+    while (level < total && level < 6) {
+        if (!equals(substr(t, level, 1), "#")) { break; }
+        level = level + 1;
+    }
+    if (level == 0 || level > 3) { return 0; }
+    if (level >= total) { return 0; }
+    if (!equals(substr(t, level, 1), " ")) { return 0; }
+    return level;
+}
+
+fun md_is_ul_item(t: string) <bool> {
+    return starts_with(t, "- ") || starts_with(t, "* ");
+}
+
+// True when t is an ordered-list item ("N. ...", N numeric).
+fun md_is_ol_item(t: string) <bool> {
+    let dot <int> = index_of_char(t, '.');
+    if (dot <= 0) { return false; }
+    if (!is_numeric(substr(t, 0, dot))) { return false; }
+    return starts_with(substr(t, dot, len(t) - dot), ". ");
+}
+
+// Ordered-list item text (after "N. "). Callers check md_is_ol_item first.
+fun md_ol_text(t: string) <string> {
+    let dot <int> = index_of_char(t, '.');
+    return trim(substr(t, dot + 2, len(t) - dot - 2));
+}
+
+// Render a whole Markdown document to an HTML fragment (no <html> wrapper).
+pub fun md_to_html(md: string) <string> {
+    let cap <int> = 8192;
+    let lines <[string]> = new [string, cap]{};
+    let n <int> = md_split_lines(md, lines, cap);
+    let st <MDState> = MDState{
+        html: "",
+        in_code: false,
+        in_ul: false,
+        in_ol: false,
+        in_quote: false,
+        para: "",
+        para_open: false
+    };
+    for (let i <int> = 0; i < n; i++) {
+        let raw <string> = lines[i];
+        let t <string> = trim(raw);
+        if (st.in_code) {
+            if (equals(t, "```")) {
+                st.html = concat(st.html, "</code></pre>\n");
+                st.in_code = false;
+            } else {
+                // Raw line: indentation is significant inside code.
+                st.html = concat(st.html, concat(md_escape_html(raw), "\n"));
+            }
+        } else if (equals(t, "")) {
+            md_close_all(&st);
+        } else if (starts_with(t, "```")) {
+            md_close_all(&st);
+            st.html = concat(st.html, "<pre><code>\n");
+            st.in_code = true;
+        } else if (equals(t, "---")) {
+            md_close_all(&st);
+            st.html = concat(st.html, "<hr>\n");
+        } else if (starts_with(t, ">")) {
+            md_close_para(&st);
+            md_close_lists(&st);
+            if (!st.in_quote) {
+                st.html = concat(st.html, "<blockquote>\n");
+                st.in_quote = true;
+            }
+            let q <string> = trim(substr(t, 1, len(t) - 1));
+            st.html = concat(st.html, concat("<p>", concat(md_inline(q), "</p>\n")));
+        } else {
+            md_close_quote(&st);
+            let hl <int> = md_heading_level(t);
+            if (hl > 0) {
+                md_close_all(&st);
+                let ht <string> = trim(substr(t, hl + 1, len(t) - hl - 1));
+                let tag <string> = "h3";
+                if (hl == 1) { tag = "h1"; }
+                if (hl == 2) { tag = "h2"; }
+                st.html = concat(st.html, concat(concat("<", tag), concat(">", concat(md_inline(ht), concat("</", concat(tag, ">\n"))))));
+            } else if (md_is_ul_item(t)) {
+                md_close_para(&st);
+                if (st.in_ol) { md_close_lists(&st); }
+                if (!st.in_ul) {
+                    st.html = concat(st.html, "<ul>\n");
+                    st.in_ul = true;
+                }
+                let item <string> = trim(substr(t, 2, len(t) - 2));
+                st.html = concat(st.html, concat("<li>", concat(md_inline(item), "</li>\n")));
+            } else if (md_is_ol_item(t)) {
+                md_close_para(&st);
+                if (st.in_ul) { md_close_lists(&st); }
+                if (!st.in_ol) {
+                    st.html = concat(st.html, "<ol>\n");
+                    st.in_ol = true;
+                }
+                let ol <string> = md_ol_text(t);
+                st.html = concat(st.html, concat("<li>", concat(md_inline(ol), "</li>\n")));
+            } else {
+                // Paragraph line: accumulate, join with newline.
+                md_close_lists(&st);
+                if (st.para_open) {
+                    st.para = concat(st.para, concat("\n", t));
+                } else {
+                    st.para = t;
+                    st.para_open = true;
+                }
+            }
+        }
+    }
+    // An unclosed fence still gets its closing tags (degraded, not broken).
+    if (st.in_code) {
+        st.html = concat(st.html, "</code></pre>\n");
+        st.in_code = false;
+    }
+    md_close_all(&st);
+    for (let k <int> = 0; k < n; k++) {
+        free_str(lines[k]);
+    }
+    delete lines;
+    return st.html;
+}
+
+}

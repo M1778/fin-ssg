@@ -1,0 +1,27 @@
+// VENDORED — replace with fin-template (Builder #2's HTML templating
+// engine) when available.
+//
+// Minimal {{key}} substitution for fin-ssg layouts. Supported keys:
+//   {{site_title}}  the --title value, for <title> and the index page
+//   {{title}}       the page title (front matter, else the file slug)
+//   {{date}}        the page date (front matter, else "")
+//   {{content}}     the rendered page HTML fragment
+// Unknown {{...}} placeholders are left untouched.
+//
+// Values are inserted as-is: page HTML is already escaped by the Markdown
+// renderer, and fin-ssg escapes title/date itself before calling tpl_render.
+// The real fin-template will add {% if %}/{% for %}/filters/inheritance —
+// until then, layouts are static shells with four slots.
+
+import { replace } from strings::std;
+
+namespace fin {
+
+pub fun tpl_render(tpl: string, site_title: string, title: string, date: string, content: string) <string> {
+    let o <string> = replace(tpl, "{{site_title}}", site_title);
+    let o2 <string> = replace(o, "{{title}}", title);
+    let o3 <string> = replace(o2, "{{date}}", date);
+    return replace(o3, "{{content}}", content);
+}
+
+}
