@@ -146,11 +146,14 @@ owned and released after each page.
 ## Tests & CI
 
 ```sh
-sh tests/smoke.sh   # frontend + native build + examples + security regressions
-OPT=-O2 sh tests/smoke.sh
-# Override compiler/library paths if needed:
-FINC=/path/to/finc FIN_LIBS=/path/to/lib/std sh tests/smoke.sh
+python3 -I tests/smoke.py --finc /path/to/finc --fin-libs /path/to/lib/std
+python3 -I tests/smoke.py --finc /path/to/finc --fin-libs /path/to/lib/std --opt=-O2
 ```
+
+The Python entry point is the portable one; `tests/smoke.sh` is a thin wrapper
+around it for the POSIX shell. Both build the generator, check the
+architecture-specific open flags, build the example site, and run the
+security, CLI, filesystem and limits regressions.
 
 The regression benchmark renders **20,001 lines** (10,000 `line`/blank pairs
 plus a tail sentinel), preserving the tail. Observed wall times on the test host
