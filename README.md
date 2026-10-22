@@ -10,6 +10,10 @@ language" demo — think a tiny Hugo.
 > passed this project's smoke, security, and architecture mapping suites on both
 > Linux hosts after correcting the architecture-specific open flags.
 > The generator remains entirely Fin; Python 3 is used only for black-box tests.
+>
+> The filesystem layer now selects its calls for the native target, so macOS and
+> Windows are compiled from the same source as Linux. What is verified natively
+> is stated per platform below; the Linux behaviour is unchanged.
 
 ## What it does
 
@@ -89,11 +93,14 @@ containing `{{content}}` stays literal and cannot introduce another substitution
 
 ## Filesystem safety and limits
 
-- Linux x86_64 or aarch64 with mounted procfs and `statx` is required. Runtime
-  `uname` selects architecture-specific `O_DIRECTORY`/`O_NOFOLLOW` values;
-  unknown architectures fail explicitly before filesystem access. No target
-  macros or compiled C bridge are required. No shell commands enumerate
-  content; native `fs::std::walk_dir` enumerates a pinned directory descriptor.
+- Linux x86_64 or aarch64, macOS, or Windows. The filesystem calls are chosen
+  for the native target (ADR 0051 addendum): Linux uses `openat`/`fstatat` with
+  the architecture-specific `O_DIRECTORY`/`O_NOFOLLOW` values, which runtime
+  `uname` selects; macOS uses the same `*at` family without `statx`; Windows
+  uses `CreateFileA` with the backup-semantics and open-reparse-point flags.
+  An unknown Linux architecture fails explicitly before filesystem access. No
+  compiled C bridge is required. No shell commands enumerate content; native
+  `fs::std::walk_dir` enumerates a pinned directory.
 - Content, layout and output paths reject symlinks in **every** component and
   reject `..`. Use direct paths, not symlink aliases. Missing output parents are
   created. Missing layouts use the default; unsafe/unreadable layouts fail.

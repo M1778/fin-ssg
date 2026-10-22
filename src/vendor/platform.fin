@@ -1,14 +1,61 @@
-// Native Linux ABI policy, shared by the CLI and mapping regression tests.
-// O_DIRECTORY/O_NOFOLLOW are architecture-specific; never guess a fallback.
-import { equals, from_chars, free_str } from strings::std;
+// Native filesystem layer, shared by the CLI and the mapping regression tests.
+//
+// The operations the generator needs are the same on every platform -- open a
+// directory without following a symlink, open a file relative to a pinned
+// directory, ask whether it is a regular file, create a temporary file
+// exclusively, rename it into place, unlink it, and flush it to storage -- but
+// the system calls are not. Linux has openat/statx/renameat and the
+// architecture-specific O_DIRECTORY and O_NOFOLLOW values; macOS has openat and
+// fstatat but no statx; Windows has none of the *at family and answers with
+// handles and Win32 calls.
+//
+// The layer below names those operations once. Each target implements them,
+// and the mapping tests check the Linux numbers, which are the ones with no
+// portable spelling.
+import { equals, from_chars, to_chars, clone, free_str, concat } from strings::std;
+
 namespace fin {
-#[llvm_name="uname"]
-@define platform_uname(buf: &char) <int>;
 
-pub struct LinuxOpenFlags { directory <int>, read_file <int>, create_file <int>, ok <bool> }
+// The open flags the generator uses, resolved for the target.
+pub struct OpenFlags { directory <int>, read_file <int>, create_file <int>, ok <bool> }
 
-pub fun linux_open_flags(system: string, machine: string) <LinuxOpenFlags> {
-    let flags <LinuxOpenFlags> = LinuxOpenFlags{directory: 0, read_file: 0, create_file: 0, ok: false};
+// A directory handle. On Linux and macOS it is a descriptor; on Windows it is
+// a HANDLE, which is pointer-width, so the type differs.
+#c_ifdef FIN_TARGET_WINDOWS
+pub type DirHandle = long;
+#c_else
+pub type DirHandle = int;
+#c_endif
+
+// The error codes, as functions: a module constant is not lowered, and a
+// function is.
+#c_ifdef FIN_TARGET_WINDOWS
+// Windows has no errno. The error of the last call is the Win32 code, and
+// the comparisons below are against these.
+pub fun error_file_not_found() <int> { return 2; }
+pub fun error_path_not_found() <int> { return 3; }
+pub fun error_already_exists() <int> { return 183; }
+pub fun error_sharing_violation() <int> { return 32; }
+#c_else
+pub fun error_file_not_found() <int> { return 2; }
+pub fun error_already_exists() <int> { return 17; }
+#c_endif
+
+// The error of the last filesystem call. On Windows the Win32 code, on
+// POSIX the errno value.
+#c_ifdef FIN_TARGET_WINDOWS
+#[llvm_name="GetLastError"]
+@define platform_last_error() <uint>;
+#c_else
+#[llvm_name="__errno_location"]
+@define platform_errno() <&int>;
+#c_endif
+
+// The Linux open flags, by architecture. O_DIRECTORY and O_NOFOLLOW have
+// different values on each, and guessing them is how a directory open ends up
+// following a symlink.
+pub fun linux_open_flags(system: string, machine: string) <OpenFlags> {
+    let flags <OpenFlags> = OpenFlags{directory: 0, read_file: 0, create_file: 0, ok: false};
     if (!equals(system, "Linux")) { return flags; }
     if (equals(machine, "x86_64")) {
         // CLOEXEC=524288, DIRECTORY=65536, NOFOLLOW=131072.
@@ -27,21 +74,416 @@ pub fun linux_open_flags(system: string, machine: string) <LinuxOpenFlags> {
     return flags;
 }
 
-pub fun detect_linux_open_flags() <LinuxOpenFlags> {
-    let unsupported <LinuxOpenFlags> = LinuxOpenFlags{directory: 0, read_file: 0, create_file: 0, ok: false};
-    // Linux struct utsname: six 65-byte fields; machine begins at byte 260.
-    let bytes <[char]> = new [char, 390]{};
-    if (platform_uname(&bytes[0]) != 0) { delete bytes; return unsupported; }
-    let system_end <int> = 0;
-    while (system_end < 65 && bytes[system_end] != cast<char>(0)) { system_end++; }
-    let machine_end <int> = 260;
-    while (machine_end < 325 && bytes[machine_end] != cast<char>(0)) { machine_end++; }
-    if (system_end == 65 || machine_end == 325) { delete bytes; return unsupported; }
-    let system <string> = from_chars(bytes, 0, system_end);
-    let machine <string> = from_chars(bytes, 260, machine_end - 260);
-    let flags <LinuxOpenFlags> = linux_open_flags(system, machine);
-    if (!flags.ok) { printf("error: unsupported platform %s/%s (requires Linux x86_64 or aarch64)\n", system, machine); }
-    free_str(system); free_str(machine); delete bytes;
-    return flags;
+// ---------------------------------------------------------------------------
+// The operations the generator needs
+// ---------------------------------------------------------------------------
+
+#c_ifdef FIN_TARGET_WINDOWS
+// Windows: a directory is a HANDLE, opened with the backup-semantics flag so
+// it can be opened at all, and with open-reparse-point so a symlink is not
+// followed. A file relative to that handle is opened by the handle's own path
+// plus the name, because Windows has no openat.
+#[llvm_name="CreateFileA"]
+@define platform_create_file(path: string, access: uint, share: uint, security: &void, disposition: uint, flags: uint, template: &void) <long>;
+
+#[llvm_name="CloseHandle"]
+@define platform_close_handle(handle: long) <int>;
+
+#[llvm_name="GetFileType"]
+@define platform_file_type(handle: long) <uint>;
+
+#[llvm_name="GetFileAttributesA"]
+@define platform_file_attributes(path: string) <uint>;
+
+#[llvm_name="GetFileInformationByHandle"]
+@define platform_file_info(handle: long, info: &char) <int>;
+
+#[llvm_name="FlushFileBuffers"]
+@define platform_flush(handle: long) <int>;
+
+#[llvm_name="MoveFileExA"]
+@define platform_rename(from: string, to: string, flags: uint) <int>;
+
+#[llvm_name="DeleteFileA"]
+@define platform_unlink(path: string) <int>;
+
+#[llvm_name="CreateDirectoryA"]
+@define platform_mkdir(path: string, security: &void) <int>;
+
+#[llvm_name="RemoveDirectoryA"]
+@define platform_rmdir(path: string) <int>;
+
+#[llvm_name="GetFinalPathNameByHandleA"]
+@define platform_final_path(handle: long, buffer: &char, size: uint, flags: uint) <uint>;
+
+#[llvm_name="GetCurrentProcessId"]
+@define platform_pid() <uint>;
+
+#[llvm_name="ReadFile"]
+@define platform_read(handle: long, buffer: &char, count: uint, read: &uint, overlapped: &void) <int>;
+
+#[llvm_name="WriteFile"]
+@define platform_write(handle: long, buffer: &char, count: uint, written: &uint, overlapped: &void) <int>;
+
+// The path of a directory handle, so a file inside it can be named.
+pub fun directory_path(handle: DirHandle) <string> {
+    let buffer <[char]> = new [char, 32768]{};
+    let length <uint> = platform_final_path(handle, &buffer[0], cast<uint>(32767), 0);
+    if (length == 0 || length >= cast<uint>(32767)) { delete buffer; return ""; }
+    let text <string> = from_chars(buffer, 0, cast<int>(length));
+    delete buffer;
+    return text;
 }
+#c_else
+// POSIX: the descriptor and the *at family. O_NOFOLLOW and O_DIRECTORY are
+// architecture-specific on Linux, so the flags come from detect_open_flags.
+#[llvm_name="openat"]
+@define platform_openat(dir: int, path: string, flags: int, mode: int) <int>;
+
+#[llvm_name="open"]
+@define platform_open(path: string, flags: int, mode: int) <int>;
+
+#[llvm_name="close"]
+@define platform_close(fd: int) <int>;
+
+#[llvm_name="read"]
+@define platform_read(fd: int, buffer: &char, count: ulong) <long>;
+
+#[llvm_name="write"]
+@define platform_write(fd: int, buffer: &char, count: ulong) <long>;
+
+#[llvm_name="fsync"]
+@define platform_fsync(fd: int) <int>;
+
+#[llvm_name="renameat"]
+@define platform_rename(old_dir: int, old: string, new_dir: int, dest: string) <int>;
+
+#[llvm_name="unlinkat"]
+@define platform_unlink(dir: int, path: string, flags: int) <int>;
+
+#[llvm_name="mkdirat"]
+@define platform_mkdirat(dir: int, path: string, mode: int) <int>;
+
+#[llvm_name="fstatat"]
+@define platform_fstatat(dir: int, path: string, info: &char, flags: int) <int>;
+
+#[llvm_name="uname"]
+@define platform_uname(buffer: &char) <int>;
+
+#[llvm_name="getpid"]
+@define platform_pid() <int>;
+
+// The path of a directory descriptor, so a file inside it can be named.
+pub fun directory_path(handle: DirHandle) <string> {
+    let path <string> = format!("/proc/self/fd/{}", handle);
+    return path;
+}
+#c_endif
+
+#c_ifdef FIN_TARGET_WINDOWS
+// What a name inside a directory is, without following it: 1 a regular file,
+// 0 not there, -1 something else. A reparse point -- a symlink or a junction
+// -- is "something else", because it is never followed.
+pub fun name_kind(dir: DirHandle, name: string) <int> {
+    let base <string> = directory_path(dir);
+    let path <string> = concat(base, concat("\\", name));
+    free_str(base);
+    let attributes <uint> = platform_file_attributes(path);
+    free_str(path);
+    if (attributes == cast<uint>(-1)) { return 0; }
+    // FILE_ATTRIBUTE_DIRECTORY is 0x10 and FILE_ATTRIBUTE_REPARSE_POINT is
+    // 0x400.
+    if ((attributes & 0x10) != cast<uint>(0)) { return -1; }
+    if ((attributes & 0x400) != cast<uint>(0)) { return -1; }
+    return 1;
+}
+#c_else
+// What a name inside a directory is, without following it: 1 a regular file,
+// 0 not there, -1 something else. AT_SYMLINK_NOFOLLOW reports a symlink
+// rather than the file it points at, which is the whole point: a symlink is
+// "something else", because it is never followed.
+pub fun name_kind(dir: DirHandle, name: string) <int> {
+    let info <[char]> = new [char, 256]{};
+    let status <int> = platform_fstatat(dir, name, &info[0], 256);
+    if (status < 0) {
+        let missing <bool> = *platform_errno() == error_file_not_found();
+        delete info;
+        if (missing) { return 0; }
+        return -1;
+    }
+    let mode <int> = (cast<int>(info[24]) & 255) + (cast<int>(info[25]) & 255) * 256;
+    delete info;
+    // S_IFMT is 0170000 and S_IFLNK is 0120000; a regular file is 0100000.
+    let kind <int> = mode & 61440;
+    if (kind == 32768) { return 1; }
+    return -1;
+}
+#c_endif
+
+// Whether the last error means the name was not there.
+pub fun platform_error_is_missing() <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    let code <int> = cast<int>(platform_last_error());
+    return code == error_file_not_found() || code == error_path_not_found();
+    #c_else
+    return *platform_errno() == error_file_not_found();
+    #c_endif
+}
+
+// Whether the last error means the name was already taken.
+pub fun platform_error_is_exists() <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    let code <int> = cast<int>(platform_last_error());
+    return code == error_already_exists() || code == error_sharing_violation();
+    #c_else
+    return *platform_errno() == error_already_exists();
+    #c_endif
+}
+
+// A file handle. On Windows it is a HANDLE, which is pointer-width; on POSIX
+// it is a descriptor.
+#c_ifdef FIN_TARGET_WINDOWS
+pub type FileHandle = long;
+#c_else
+pub type FileHandle = int;
+#c_endif
+
+// ---------------------------------------------------------------------------
+// The operations, one spelling per target
+// ---------------------------------------------------------------------------
+
+#c_ifdef FIN_TARGET_WINDOWS
+// Opens a directory by path, refusing to follow a symlink at the last
+// component. The path is walked component by component so that a symlink
+// anywhere in the path is refused, not only at the end.
+pub fun platform_open_directory(path: string, create: bool) <DirHandle> {
+    let invalid <DirHandle> = -1;
+    let chars <[char]> = to_chars(path);
+    let total <int> = chars.length - 1;
+    if (total == 0) { delete chars; return invalid; }
+    // The handle of the current directory, and the path of it, so each
+    // component can be opened relative to the last.
+    let current <string> = ".";
+    if (chars[0] == '/' || chars[0] == '\\') { current = "\\"; }
+    let handle <DirHandle> = platform_create_file(current, 0, 7, null, 3, 0x02000000 | 0x00200000, null);
+    if (handle == invalid) { delete chars; return invalid; }
+    let i <int> = 0;
+    while (handle != invalid && i < total) {
+        while (i < total && (chars[i] == '/' || chars[i] == '\\')) { i++; }
+        let start <int> = i;
+        while (i < total && chars[i] != '/' && chars[i] != '\\') { i++; }
+        if (start == i) { break; }
+        let part <string> = from_chars(chars, start, i - start);
+        if (equals(part, ".")) { free_str(part); continue; }
+        if (equals(part, "..")) { free_str(part); platform_close_handle(handle); return invalid; }
+        let base <string> = directory_path(handle);
+        let child <string> = concat(base, concat("\\", part));
+        free_str(base); free_str(part);
+        let next <DirHandle> = platform_create_file(child, 0, 7, null, 3, 0x02000000 | 0x00200000, null);
+        if (next == invalid && create) {
+            platform_mkdir(child, null);
+            next = platform_create_file(child, 0, 7, null, 3, 0x02000000 | 0x00200000, null);
+        }
+        platform_close_handle(handle);
+        handle = next;
+    }
+    delete chars;
+    return handle;
+}
+#c_else
+// Opens a directory by path, refusing to follow a symlink in any component.
+// '..' is refused outright: a path that walks up is not a path the caller
+// named.
+pub fun platform_open_directory(path: string, create: bool, flags: OpenFlags) <DirHandle> {
+    let invalid <DirHandle> = -1;
+    if (!flags.ok) { return invalid; }
+    let chars <[char]> = to_chars(path);
+    let total <int> = chars.length - 1;
+    if (total == 0) { delete chars; return invalid; }
+    let base <string> = ".";
+    if (chars[0] == '/') { base = "/"; }
+    let handle <DirHandle> = platform_open(base, flags.directory, 0);
+    let i <int> = 0;
+    while (handle != invalid && i < total) {
+        while (i < total && chars[i] == '/') { i++; }
+        let start <int> = i;
+        while (i < total && chars[i] != '/') { i++; }
+        if (start == i) { break; }
+        let part <string> = from_chars(chars, start, i - start);
+        if (equals(part, ".")) { free_str(part); continue; }
+        if (equals(part, "..")) { free_str(part); platform_close(handle); return invalid; }
+        let next <DirHandle> = platform_openat(handle, part, flags.directory, 0);
+        if (next == invalid && create && *platform_errno() == 2) {
+            platform_mkdirat(handle, part, 493);
+            next = platform_openat(handle, part, flags.directory, 0);
+        }
+        free_str(part);
+        platform_close(handle);
+        handle = next;
+    }
+    delete chars;
+    return handle;
+}
+#c_endif
+
+// ---------------------------------------------------------------------------
+// Files, relative to a pinned directory
+// ---------------------------------------------------------------------------
+
+#c_ifdef FIN_TARGET_WINDOWS
+// Opens a file inside a directory, refusing to follow a symlink at the name.
+// The name is joined to the directory's own path, because Windows has no
+// openat. `create` says whether the file is being made or read.
+pub fun open_in_directory(dir: DirHandle, name: string, create: bool) <FileHandle> {
+    let invalid <FileHandle> = -1;
+    let base <string> = directory_path(dir);
+    let path <string> = concat(base, concat("\\", name));
+    free_str(base);
+    // GENERIC_READ for a read, GENERIC_WRITE for a creation; the disposition
+    // says whether the file must exist or must not.
+    let access <uint> = 0x80000000;
+    let disposition <uint> = 3;
+    if (create) { access = 0x40000000; disposition = 1; }
+    let handle <FileHandle> = platform_create_file(path, access, 7, null, disposition, 0x02000000 | 0x00200000, null);
+    free_str(path);
+    return handle;
+}
+
+// Whether the handle is a regular file. A directory handle and a reparse
+// point are not.
+pub fun is_regular_file(handle: FileHandle) <bool> {
+    let info <[char]> = new [char, 256]{};
+    if (platform_file_info(handle, &info[0]) == 0) { delete info; return false; }
+    // The attributes are at offset 32 of the BY_HANDLE_FILE_INFORMATION
+    // structure, and FILE_ATTRIBUTE_DIRECTORY is 0x10.
+    let attributes <int> = (cast<int>(info[32]) & 255) + (cast<int>(info[33]) & 255) * 256;
+    delete info;
+    if ((attributes & 16) == 16) { return false; }
+    return true;
+}
+#c_else
+// Opens a file inside a directory, relative to the directory descriptor, so
+// the name cannot be redirected by a concurrent rename of the parent.
+pub fun open_in_directory(dir: DirHandle, name: string, create: bool, flags: OpenFlags) <FileHandle> {
+    if (create) {
+        // WRONLY|CREAT|EXCL, mode 0644 respects the umask.
+        return platform_openat(dir, name, flags.create_file, 420);
+    }
+    return platform_openat(dir, name, flags.read_file, 0);
+}
+
+// Whether the descriptor is a regular file. The mode is the st_mode field of
+// the stat structure, and S_IFREG is 0100000.
+pub fun is_regular_file(handle: FileHandle) <bool> {
+    let info <[char]> = new [char, 256]{};
+    // AT_EMPTY_PATH asks about the descriptor itself rather than a name.
+    let status <int> = platform_fstatat(handle, "", &info[0], 4096);
+    if (status < 0) { delete info; return false; }
+    let mode <int> = (cast<int>(info[24]) & 255) + (cast<int>(info[25]) & 255) * 256;
+    delete info;
+    if ((mode & 61440) == 32768) { return true; }
+    return false;
+}
+#c_endif
+
+// ---------------------------------------------------------------------------
+// The operations on a file
+// ---------------------------------------------------------------------------
+
+#c_ifdef FIN_TARGET_WINDOWS
+pub fun file_read(handle: FileHandle, buffer: &char, count: int) <int> {
+    let read <uint> = 0;
+    if (platform_read(handle, buffer, cast<uint>(count), &read, null) == 0) { return -1; }
+    return cast<int>(read);
+}
+
+pub fun file_write(handle: FileHandle, buffer: &char, count: int) <int> {
+    let written <uint> = 0;
+    if (platform_write(handle, buffer, cast<uint>(count), &written, null) == 0) { return -1; }
+    return cast<int>(written);
+}
+
+pub fun file_flush(handle: FileHandle) <bool> { return platform_flush(handle) == 0; }
+
+pub fun file_close(handle: FileHandle) <bool> { return platform_close_handle(handle) == 0; }
+
+// Renames a file into place. MOVEFILE_REPLACE_EXISTING replaces the
+// destination, which is what replacing an output file means.
+pub fun rename_in_directory(dir: DirHandle, old_name: string, dest: string) <bool> {
+    let base <string> = directory_path(dir);
+    let from_path <string> = concat(base, concat("\\", old_name));
+    let dest_path <string> = concat(base, concat("\\", dest));
+    free_str(base);
+    let ok <bool> = platform_rename(from_path, dest_path, 1) != 0;
+    free_str(from_path);
+    free_str(dest_path);
+    return ok;
+}
+
+pub fun unlink_in_directory(dir: DirHandle, name: string) <bool> {
+    let base <string> = directory_path(dir);
+    let path <string> = concat(base, concat("\\", name));
+    free_str(base);
+    let ok <bool> = platform_unlink(path) != 0;
+    free_str(path);
+    return ok;
+}
+
+// A directory cannot be flushed on Windows: FlushFileBuffers refuses a
+// directory handle. The publication contract is therefore per file there, and
+// the directory entry is not separately durable.
+pub fun directory_flush(dir: DirHandle) <bool> { return true; }
+#c_else
+pub fun file_read(handle: FileHandle, buffer: &char, count: int) <int> {
+    let got <long> = platform_read(handle, buffer, cast<ulong>(count));
+    if (got < cast<long>(0)) { return -1; }
+    return cast<int>(got);
+}
+
+pub fun file_write(handle: FileHandle, buffer: &char, count: int) <int> {
+    let wrote <long> = platform_write(handle, buffer, cast<ulong>(count));
+    if (wrote < cast<long>(0)) { return -1; }
+    return cast<int>(wrote);
+}
+
+pub fun file_flush(handle: FileHandle) <bool> { return platform_fsync(handle) == 0; }
+
+pub fun file_close(handle: FileHandle) <bool> { return platform_close(handle) == 0; }
+
+pub fun rename_in_directory(dir: DirHandle, old_name: string, dest: string) <bool> {
+    return platform_rename(dir, old_name, dir, dest) == 0;
+}
+
+pub fun unlink_in_directory(dir: DirHandle, name: string) <bool> {
+    return platform_unlink(dir, name, 0) == 0;
+}
+
+pub fun directory_flush(dir: DirHandle) <bool> { return platform_fsync(dir) == 0; }
+#c_endif
+
+// The flags the running host uses. The Linux numbers come from the
+// architecture; the other targets have their own constants.
+pub fun detect_open_flags() <OpenFlags> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    // FILE_FLAG_BACKUP_SEMANTICS is what lets a directory be opened at all.
+    // FILE_FLAG_OPEN_REPARSE_POINT refuses to follow a symlink, which is what
+    // the nofollow check needs.
+    return OpenFlags{directory: 0x02000000, read_file: 0x02000000, create_file: 0x02000000, ok: true};
+    #c_else
+    let info <[char]> = new [char, 390]{};
+    if (platform_uname(&info[0]) != 0) { delete info; return OpenFlags{directory: 0, read_file: 0, create_file: 0, ok: false}; }
+    let system_end <int> = 0;
+    while (system_end < 65 && info[system_end] != cast<char>(0)) { system_end++; }
+    let machine_end <int> = 260;
+    while (machine_end < 325 && info[machine_end] != cast<char>(0)) { machine_end++; }
+    if (system_end == 65 || machine_end == 325) { delete info; return OpenFlags{directory: 0, read_file: 0, create_file: 0, ok: false}; }
+    let system <string> = from_chars(info, 0, system_end);
+    let machine <string> = from_chars(info, 260, machine_end - 260);
+    let flags <OpenFlags> = linux_open_flags(system, machine);
+    if (!flags.ok) { printf("error: unsupported platform %s/%s (requires Linux x86_64 or aarch64)\n", system, machine); }
+    free_str(system); free_str(machine); delete info;
+    return flags;
+    #c_endif
+}
+
 }

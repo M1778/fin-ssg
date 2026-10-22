@@ -5,32 +5,7 @@ import { walk_dir } from fs::std;
 import { len, equals, ends_with, substr, concat, clone, to_lower, to_chars, from_chars, free_str, compare } from strings::std;
 import { TextBuffer, text_buffer, text_char, text_append, text_finish, md_to_html, md_escape_into, filename_url } from markdown::fin;
 import { tpl_render } from template::fin;
-import { LinuxOpenFlags, detect_linux_open_flags } from platform::fin;
-
-#[llvm_name="open"]
-@define ssg_open(path: string, flags: int) <int>;
-#[llvm_name="openat"]
-@define ssg_openat(dir: int, path: string, flags: int, mode: int) <int>;
-#[llvm_name="read"]
-@define ssg_read(fd: int, buf: &char, count: ulong) <long>;
-#[llvm_name="write"]
-@define ssg_write(fd: int, buf: &char, count: ulong) <long>;
-#[llvm_name="close"]
-@define ssg_close(fd: int) <int>;
-#[llvm_name="mkdirat"]
-@define ssg_mkdirat(fd: int, path: string, mode: int) <int>;
-#[llvm_name="renameat"]
-@define ssg_renameat(old_dir: int, old: string, new_dir: int, dest: string) <int>;
-#[llvm_name="unlinkat"]
-@define ssg_unlinkat(dir: int, path: string, flags: int) <int>;
-#[llvm_name="fsync"]
-@define ssg_fsync(fd: int) <int>;
-#[llvm_name="statx"]
-@define ssg_statx(fd: int, path: string, flags: int, mask: uint, buf: &char) <int>;
-#[llvm_name="__errno_location"]
-@define ssg_errno() <&int>;
-#[llvm_name="getpid"]
-@define ssg_pid() <int>;
+import { OpenFlags, DirHandle, FileHandle, detect_open_flags, platform_open_directory, open_in_directory, is_regular_file, name_kind, file_read, file_write, file_flush, file_close, rename_in_directory, unlink_in_directory, directory_flush, directory_path, platform_pid, platform_error_is_missing, platform_error_is_exists } from platform::fin;
 
 const MAX_ARGS <int> = 256;
 const MAX_ARG_BYTES <int> = 65536;
@@ -38,38 +13,24 @@ const MAX_FILES <int> = 4096;
 const MAX_INPUT <int> = 4194304;
 
 struct Argv { args <[string]>, count <int>, ok <bool> }
-fun read_argv() <Argv> {
+// The arguments the process was started with, bounded. The compiler's own
+// argv surface hands them over, so no platform accessor is involved.
+fun read_argv(args: [string]) <Argv> {
     let result <Argv> = Argv{args: new [string, MAX_ARGS]{}, count: 0, ok: false};
-    let buf <[char]> = new [char, MAX_ARG_BYTES + 1]{};
-    let fd <int> = ssg_open("/proc/self/cmdline", 524288);
-    if (fd < 0) { delete buf; return result; }
-    let used <int> = 0;
-    let good <bool> = true;
-    while (used <= MAX_ARG_BYTES) {
-        let got <long> = ssg_read(fd, &buf[used], cast<ulong>(MAX_ARG_BYTES + 1 - used));
-        if (got < cast<long>(0)) {
-            if (*ssg_errno() == 4) { continue; }
-            good = false; break;
-        }
-        if (got == cast<long>(0)) { break; }
-        used = used + cast<int>(got);
+    // The compiler's argv surface hands over the user's arguments, with the
+    // program name already removed.
+    let total <int> = args.length;
+    if (total > MAX_ARGS) { return result; }
+    let bytes <int> = 0;
+    for (let i <int> = 0; i < total; i++) {
+        let value <string> = args[i];
+        if (value == null) { return result; }
+        bytes = bytes + len(value);
+        if (bytes > MAX_ARG_BYTES) { return result; }
+        result.args[result.count] = clone(value);
+        result.count++;
     }
-    ssg_close(fd);
-    if (!good || used == 0 || used > MAX_ARG_BYTES || buf[used - 1] != cast<char>(0)) { delete buf; return result; }
-    let start <int> = 0;
-    let first <bool> = true;
-    for (let i <int> = 0; i < used; i++) {
-        if (buf[i] == cast<char>(0)) {
-            if (first) { first = false; }
-            else {
-                if (result.count == MAX_ARGS) { delete buf; return result; }
-                let value <string> = from_chars(buf, start, i - start);
-                result.args[result.count] = value; result.count++;
-            }
-            start = i + 1;
-        }
-    }
-    delete buf; result.ok = true; return result;
+    result.ok = true; return result;
 }
 fun free_argv(argv: &Argv) <noret> {
     for (let i <int> = 0; i < argv.count; i++) { free_str(argv.args[i]); }
@@ -78,68 +39,28 @@ fun free_argv(argv: &Argv) <noret> {
 
 // Walk every path component without following symlinks, including ancestors.
 // '..' is deliberately refused. The returned fd pins the final directory.
-fun open_directory(path: string, create: bool, abi: LinuxOpenFlags) <int> {
-    if (!abi.ok) { *ssg_errno() = 22; return -1; }
-    let chars <[char]> = to_chars(path);
-    let total <int> = chars.length - 1;
-    if (total == 0) { delete chars; *ssg_errno() = 22; return -1; }
-    let base <string> = ".";
-    if (chars[0] == '/') { base = "/"; }
-    let fd <int> = ssg_open(base, abi.directory);
-    let i <int> = 0;
-    while (fd >= 0 && i < total) {
-        while (i < total && chars[i] == '/') { i++; }
-        let start <int> = i;
-        while (i < total && chars[i] != '/') { i++; }
-        if (start == i) { break; }
-        let part <string> = from_chars(chars, start, i - start);
-        if (equals(part, ".")) { free_str(part); continue; }
-        if (equals(part, "..")) { free_str(part); ssg_close(fd); fd = -1; *ssg_errno() = 22; break; }
-        let next <int> = ssg_openat(fd, part, abi.directory, 0);
-        if (next < 0 && create && *ssg_errno() == 2) {
-            ssg_mkdirat(fd, part, 493);
-            next = ssg_openat(fd, part, abi.directory, 0);
-        }
-        free_str(part); ssg_close(fd); fd = next;
-    }
-    delete chars; return fd;
+// Whether a name inside a directory is a regular file: 1 regular, 0 missing,
+// -1 special/symlink/error. The descriptor is asked about the name itself,
+// so a symlink is never followed to find out.
+fun regular_file(dir: DirHandle, name: string, abi: OpenFlags) <int> {
+    return name_kind(dir, name);
 }
 
-// statx has a stable Linux ABI: stx_mode is a 16-bit field at byte 28.
-// Returns 1 regular, 0 missing, -1 special/symlink/error. AT_EMPTY_PATH
-// validates the already-open descriptor, avoiding check/open races.
-fun regular_file(fd: int, path: string, empty: bool) <int> {
-    let bytes <[char]> = new [char, 256]{};
-    let flags <int> = 256;
-    if (empty) { flags = flags + 4096; }
-    let status <int> = ssg_statx(fd, path, flags, cast<uint>(1), &bytes[0]);
-    if (status < 0) {
-        let missing <bool> = *ssg_errno() == 2;
-        delete bytes;
-        if (missing) { return 0; }
-        return -1;
-    }
-    let mode <int> = (cast<int>(bytes[28]) & 255) + (cast<int>(bytes[29]) & 255) * 256;
-    delete bytes;
-    if ((mode & 61440) == 32768) { return 1; }
-    return -1;
-}
-
-fun? read_file(fd: int, name: string, abi: LinuxOpenFlags) <string> {
+fun? read_file(dir: DirHandle, name: string, abi: OpenFlags) <string> {
     if (!abi.ok) { return null; }
-    let file <int> = ssg_openat(fd, name, abi.read_file, 0);
+    let file <FileHandle> = open_in_directory(dir, name, false, abi);
     if (file < 0) { return null; }
-    if (regular_file(file, "", true) != 1) { ssg_close(file); return null; }
+    if (!is_regular_file(file)) { file_close(file); return null; }
     let buf <[char]> = new [char, MAX_INPUT + 1]{};
     let used <int> = 0;
     let ok <bool> = true;
     while (used <= MAX_INPUT) {
-        let got <long> = ssg_read(file, &buf[used], cast<ulong>(MAX_INPUT + 1 - used));
-        if (got < cast<long>(0)) { if (*ssg_errno() == 4) { continue; } ok = false; break; }
-        if (got == cast<long>(0)) { break; }
-        used = used + cast<int>(got);
+        let got <int> = file_read(file, &buf[used], MAX_INPUT + 1 - used);
+        if (got < 0) { ok = false; break; }
+        if (got == 0) { break; }
+        used = used + got;
     }
-    if (ssg_close(file) != 0) { ok = false; }
+    if (!file_close(file)) { ok = false; }
     if (used > MAX_INPUT) { ok = false; }
     // NUL cannot be represented in Fin string input; never silently discard it.
     for (let i <int> = 0; ok && i < used; i++) { if (buf[i] == cast<char>(0)) { ok = false; } }
@@ -150,17 +71,17 @@ fun? read_file(fd: int, name: string, abi: LinuxOpenFlags) <string> {
 
 // Exclusive temp creation and rename relative to the same pinned directory.
 // Reject existing special files. A raced-in symlink is replaced, never followed.
-fun atomic_write(dir: int, dest: string, text: string, abi: LinuxOpenFlags) <bool> {
+fun atomic_write(dir: DirHandle, dest: string, text: string, abi: OpenFlags) <bool> {
     if (!abi.ok) { return false; }
-    if (regular_file(dir, dest, false) < 0) { return false; }
+    if (regular_file(dir, dest, abi) < 0) { return false; }
     let temp <string> = "";
-    let fd <int> = -1;
+    let fd <FileHandle> = -1;
     for (let attempt <int> = 0; attempt < 128; attempt++) {
-        temp = format!(".fin-ssg-{}-{}.tmp", ssg_pid(), attempt);
-        // WRONLY|CREAT|EXCL|NOFOLLOW|CLOEXEC; mode 0644 respects umask.
-        fd = ssg_openat(dir, temp, abi.create_file, 420);
+        temp = format!(".fin-ssg-{}-{}.tmp", platform_pid(), attempt);
+        // Created exclusively, so a name that already exists is never reused.
+        fd = open_in_directory(dir, temp, true, abi);
         if (fd >= 0) { break; }
-        let exists <bool> = *ssg_errno() == 17;
+        let exists <bool> = platform_error_is_exists();
         free_str(temp);
         if (!exists) { return false; }
     }
@@ -170,24 +91,24 @@ fun atomic_write(dir: int, dest: string, text: string, abi: LinuxOpenFlags) <boo
     let done <int> = 0;
     let ok <bool> = true;
     while (done < count) {
-        let wrote <long> = ssg_write(fd, &chars[done], cast<ulong>(count - done));
-        if (wrote < cast<long>(0) && *ssg_errno() == 4) { continue; }
-        if (wrote <= cast<long>(0)) { ok = false; break; }
-        done = done + cast<int>(wrote);
+        let wrote <int> = file_write(fd, &chars[done], count - done);
+        if (wrote < 0) { ok = false; break; }
+        if (wrote == 0) { ok = false; break; }
+        done = done + wrote;
     }
     delete chars;
-    if (ok && ssg_fsync(fd) != 0) { ok = false; }
-    if (ssg_close(fd) != 0) { ok = false; }
-    if (ok && regular_file(dir, dest, false) < 0) { ok = false; }
-    if (ok && ssg_renameat(dir, temp, dir, dest) != 0) { ok = false; }
-    if (!ok) { ssg_unlinkat(dir, temp, 0); }
-    else if (ssg_fsync(dir) != 0) { ok = false; }
+    if (ok && !file_flush(fd)) { ok = false; }
+    if (!file_close(fd)) { ok = false; }
+    if (ok && regular_file(dir, dest, abi) < 0) { ok = false; }
+    if (ok && !rename_in_directory(dir, temp, dest)) { ok = false; }
+    if (!ok) { unlink_in_directory(dir, temp); }
+    else if (!directory_flush(dir)) { ok = false; }
     free_str(temp); return ok;
 }
 
 struct FileList { files <[string]>, count <int>, ok <bool> }
-fun list_md_files(fd: int) <FileList> {
-    let path <string> = format!("/proc/self/fd/{}", fd);
+fun list_md_files(fd: DirHandle) <FileList> {
+    let path <string> = directory_path(fd);
     let entries <[string]> = walk_dir(path);
     free_str(path);
     let list <FileList> = FileList{files: new [string, MAX_FILES]{}, count: 0, ok: true};
@@ -295,53 +216,53 @@ fun safe_names(files: &FileList) <bool> {
     return ok;
 }
 
-fun build_site(content: string, layout_dir: string, out: string, title: string, abi: LinuxOpenFlags) <int> {
-    let input <int> = open_directory(content, false, abi);
+fun build_site(content: string, layout_dir: string, out: string, title: string, abi: OpenFlags) <int> {
+    let input <int> = platform_open_directory(content, false, abi);
     if (input < 0) { printf("error: content must be a readable, non-symlink directory: %s\n", content); return 1; }
     let files <FileList> = list_md_files(input);
     if (!files.ok || files.count == 0) {
         printf("error: content listing failed, is empty, or exceeds 4096 Markdown files\n");
-        free_files(&files); ssg_close(input); return 1;
+        free_files(&files); file_close(input); return 1;
     }
     // Preflight all reserved names before making any output changes.
     if (!safe_names(&files)) {
         printf("error: index.md is reserved; output names must be unique ignoring ASCII case\n");
-        free_files(&files); ssg_close(input); return 1;
+        free_files(&files); file_close(input); return 1;
     }
     let layout <string> = clone(default_layout());
-    let layout_fd <int> = open_directory(layout_dir, false, abi);
+    let layout_fd <int> = platform_open_directory(layout_dir, false, abi);
     let layout_error <bool> = false;
     if (layout_fd < 0) {
-        if (*ssg_errno() != 2) { layout_error = true; }
+        if (!platform_error_is_missing()) { layout_error = true; }
     } else {
-        let state <int> = regular_file(layout_fd, "page.html", false);
+        let state <int> = regular_file(layout_fd, "page.html", abi);
         if (state < 0) { layout_error = true; }
         else if (state == 1) {
             let value? <string> = read_file(layout_fd, "page.html", abi);
             if (value == null) { layout_error = true; }
             else { free_str(layout); layout = value?; }
         }
-        ssg_close(layout_fd);
+        file_close(layout_fd);
     }
     if (layout_error) {
         printf("error: unsafe/unreadable layout or input exceeds 4 MiB\n");
-        free_str(layout); free_files(&files); ssg_close(input); return 1;
+        free_str(layout); free_files(&files); file_close(input); return 1;
     }
-    let output <int> = open_directory(out, true, abi);
+    let output <int> = platform_open_directory(out, true, abi);
     if (output < 0) {
         printf("error: cannot open/create non-symlink output directory: %s\n", out);
-        free_str(layout); free_files(&files); ssg_close(input); return 1;
+        free_str(layout); free_files(&files); file_close(input); return 1;
     }
-    let safe <bool> = regular_file(output, "index.html", false) >= 0;
+    let safe <bool> = regular_file(output, "index.html", abi) >= 0;
     for (let i <int> = 0; safe && i < files.count; i++) {
         let slug <string> = substr(files.files[i], 0, len(files.files[i]) - 3);
         let dest <string> = concat(slug, ".html");
-        if (regular_file(output, dest, false) < 0) { printf("error: unsafe output file: %s\n", dest); safe = false; }
+        if (regular_file(output, dest, abi) < 0) { printf("error: unsafe output file: %s\n", dest); safe = false; }
         free_str(dest); free_str(slug);
     }
     if (!safe) {
         printf("error: output preflight refused a symlink/special file\n");
-        ssg_close(output); free_str(layout); free_files(&files); ssg_close(input); return 1;
+        file_close(output); free_str(layout); free_files(&files); file_close(input); return 1;
     }
     let index <TextBuffer> = text_buffer();
     text_append(&index, "<h1>"); md_escape_into(&index, title); text_append(&index, "</h1>\n<ul>\n");
@@ -377,15 +298,15 @@ fun build_site(content: string, layout_dir: string, out: string, title: string, 
         free_str(body?);
         if (page != null) { index_ok = atomic_write(output, "index.html", page?, abi); free_str(page?); }
     }
-    ssg_close(output); ssg_close(input); free_str(layout); free_files(&files);
+    file_close(output); file_close(input); free_str(layout); free_files(&files);
     if (!index_ok) { printf("error: index rendering limit or publication failure\n"); return 1; }
     printf("fin-ssg: %d page(s) + index -> %s/ (%d skipped)\n", built, out, failed);
     if (failed > 0) { return 2; }
     return 0;
 }
 
-fun main() <int> {
-    let abi <LinuxOpenFlags> = detect_linux_open_flags();
+fun main(args: [string]) <int> {
+    let abi <OpenFlags> = detect_open_flags();
     if (!abi.ok) { printf("error: cannot select safe Linux open flags; refusing filesystem access\n"); return 1; }
     let ap <ArgParser> = new_arg_parser("fin-ssg", "Static site generator");
     ap.add_option("--content", "-c", "content", "content directory");
@@ -393,9 +314,9 @@ fun main() <int> {
     ap.add_option("--out", "-o", "public", "output directory");
     ap.add_option("--title", "-t", "My Site", "site title");
     ap.add_flag("--help", "-h", "show help");
-    let argv <Argv> = read_argv();
+    let argv <Argv> = read_argv(args);
     let result <int> = 1;
-    if (!argv.ok) { printf("error: cannot read complete argv (Linux procfs; max 256 args / 65536 bytes)\n"); }
+    if (!argv.ok) { printf("error: cannot read complete argv (max 256 args / 65536 bytes)\n"); }
     else if (!ap.parse(argv.args, argv.count)) { printf("error: %s\n", ap.error_msg); }
     else if (ap.get_positional_count() != 0) { printf("error: unexpected positional argument\n"); }
     else if (ap.get_flag("--help")) { print_usage(); result = 0; }

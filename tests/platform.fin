@@ -1,19 +1,19 @@
 // Pure mappings run on every host; detection exercises the current host ABI.
-import { LinuxOpenFlags, linux_open_flags, detect_linux_open_flags } from platform::fin;
+import { OpenFlags, linux_open_flags, detect_open_flags } from platform::fin;
 
 fun rejected(system: string, machine: string) <noret> {
-    let flags <LinuxOpenFlags> = linux_open_flags(system, machine);
+    let flags <OpenFlags> = linux_open_flags(system, machine);
     blame !flags.ok;
     blame flags.directory == 0 && flags.read_file == 0 && flags.create_file == 0;
 }
 
 fun main() <int> {
-    let x86 <LinuxOpenFlags> = linux_open_flags("Linux", "x86_64");
+    let x86 <OpenFlags> = linux_open_flags("Linux", "x86_64");
     blame x86.ok;
     blame x86.directory == 524288 + 65536 + 131072;
     blame x86.read_file == 524288 + 2048 + 131072;
     blame x86.create_file == 524288 + 131072 + 1 + 64 + 128;
-    let arm <LinuxOpenFlags> = linux_open_flags("Linux", "aarch64");
+    let arm <OpenFlags> = linux_open_flags("Linux", "aarch64");
     blame arm.ok;
     blame arm.directory == 573440;
     blame arm.read_file == 559104;
@@ -28,9 +28,11 @@ fun main() <int> {
     rejected("Linux", "");
     rejected("Darwin", "x86_64");
     rejected("FreeBSD", "aarch64");
-    let host <LinuxOpenFlags> = detect_linux_open_flags();
+    let host <OpenFlags> = detect_open_flags();
     blame host.ok;
+    #c_ifdef FIN_TARGET_LINUX
     blame host.directory == x86.directory || host.directory == arm.directory;
-    printf("Linux open-flag mapping and host detection tests passed\n");
+    #c_endif
+    printf("open-flag mapping and host detection tests passed\n");
     return 0;
 }
