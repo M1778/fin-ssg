@@ -15,4 +15,4 @@ entrypoint = "main.fin"
 [scripts]
 check = "finc -I src/vendor src/main.fin"
 build = "finc -I src/vendor src/main.fin -o fin-ssg"
-smoke = "sh tests/smoke.sh"
+smoke = "python3 -I tests/smoke.py"

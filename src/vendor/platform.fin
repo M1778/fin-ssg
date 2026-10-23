@@ -2,22 +2,34 @@
 //
 // The operations the generator needs are the same on every platform -- open a
 // directory without following a symlink, open a file relative to a pinned
-// directory, ask whether it is a regular file, create a temporary file
+// directory, ask whether a name is a regular file, create a temporary file
 // exclusively, rename it into place, unlink it, and flush it to storage -- but
-// the system calls are not. Linux has openat/statx/renameat and the
-// architecture-specific O_DIRECTORY and O_NOFOLLOW values; macOS has openat and
-// fstatat but no statx; Windows has none of the *at family and answers with
-// handles and Win32 calls.
+// the system calls are not. Linux has openat/fstatat/renameat and the
+// architecture-specific O_DIRECTORY and O_NOFOLLOW values; macOS has the *at
+// family but different numbers and a different stat layout; Windows has none
+// of the *at family and answers with handles and Win32 calls.
 //
 // The layer below names those operations once. Each target implements them,
-// and the mapping tests check the Linux numbers, which are the ones with no
+// and the mapping tests check the numbers, which are the ones with no
 // portable spelling.
+//
+// Two rules run through it. A number that differs per target is never
+// guessed: it is either selected by the target selectors at compile time, or
+// read from the running host at run time and carried in the target's ABI
+// record. And a name that is not a regular file is refused rather than
+// followed, because a symlink in the content directory is how a generator
+// publishes a file it did not write.
 import { equals, from_chars, to_chars, clone, free_str, concat } from strings::std;
 
 namespace fin {
 
-// The open flags the generator uses, resolved for the target.
-pub struct OpenFlags { directory <int>, read_file <int>, create_file <int>, ok <bool> }
+// The target's ABI numbers: the open flags the generator uses, where st_mode
+// sits in the stat structure, and the fstatat flag that refuses to follow a
+// symlink. They differ per operating system and per architecture, and a
+// guessed number is how a directory open ends up following a symlink.
+//
+// Runtime uname identifies the host ABI for the native compiler's target.
+pub struct TargetAbi { directory <int>, read_file <int>, create_file <int>, stat_mode_offset <int>, nofollow_flag <int>, ok <bool> }
 
 // A directory handle. On Linux and macOS it is a descriptor; on Windows it is
 // a HANDLE, which is pointer-width, so the type differs.
@@ -42,36 +54,65 @@ pub fun error_already_exists() <int> { return 17; }
 #c_endif
 
 // The error of the last filesystem call. On Windows the Win32 code, on
-// POSIX the errno value.
+// POSIX the errno value. Darwin spells the errno accessor __error and has no
+// __errno_location at all, so the name is selected here.
 #c_ifdef FIN_TARGET_WINDOWS
 #[llvm_name="GetLastError"]
 @define platform_last_error() <uint>;
 #c_else
+#c_ifdef FIN_TARGET_DARWIN
+#[llvm_name="__error"]
+#c_else
 #[llvm_name="__errno_location"]
+#c_endif
 @define platform_errno() <&int>;
 #c_endif
 
-// The Linux open flags, by architecture. O_DIRECTORY and O_NOFOLLOW have
-// different values on each, and guessing them is how a directory open ends up
-// following a symlink.
-pub fun linux_open_flags(system: string, machine: string) <OpenFlags> {
-    let flags <OpenFlags> = OpenFlags{directory: 0, read_file: 0, create_file: 0, ok: false};
-    if (!equals(system, "Linux")) { return flags; }
-    if (equals(machine, "x86_64")) {
-        // CLOEXEC=524288, DIRECTORY=65536, NOFOLLOW=131072.
-        flags.directory = 720896;
-        flags.read_file = 657408;
-        flags.create_file = 655553;
-        flags.ok = true;
-    } else if (equals(machine, "aarch64")) {
-        // CLOEXEC=524288, DIRECTORY=16384, NOFOLLOW=32768.
-        // Read adds NONBLOCK=2048; creation adds WRONLY|CREAT|EXCL=193.
-        flags.directory = 573440;
-        flags.read_file = 559104;
-        flags.create_file = 557249;
-        flags.ok = true;
+// The open flags and the stat layout, by operating system and architecture.
+//
+// Linux x86_64: CLOEXEC=524288, DIRECTORY=65536, NOFOLLOW=131072,
+// NONBLOCK=2048, WRONLY=1, CREAT=64, EXCL=128. The stat structure orders
+// st_nlink before st_mode, so st_mode is at byte 24.
+// Linux aarch64: DIRECTORY=16384 and NOFOLLOW=32768 -- and O_DIRECT, which
+// is bit 16 on x86_64, is bit 14 here, so a flag copied between the two
+// architectures opens the file the wrong way. The stat structure has no
+// st_nlink in front of st_mode, so st_mode is at byte 16.
+// Darwin: CLOEXEC=16777216, DIRECTORY=1048576, NOFOLLOW=256,
+// NONBLOCK=4, WRONLY=1, CREAT=512, EXCL=2048. AT_SYMLINK_NOFOLLOW is 32.
+// The modern inode64 stat layout has st_mode at byte 4.
+pub fun posix_abi(system: string, machine: string) <TargetAbi> {
+    let abi <TargetAbi> = TargetAbi{directory: 0, read_file: 0, create_file: 0, stat_mode_offset: 0, nofollow_flag: 0, ok: false};
+    if (equals(system, "Linux")) {
+        if (equals(machine, "x86_64")) {
+            abi.directory = 720896;
+            abi.read_file = 657408;
+            abi.create_file = 655553;
+            abi.stat_mode_offset = 24;
+            abi.nofollow_flag = 256;
+            abi.ok = true;
+        } else if (equals(machine, "aarch64")) {
+            abi.directory = 573440;
+            abi.read_file = 559104;
+            abi.create_file = 557249;
+            abi.stat_mode_offset = 16;
+            abi.nofollow_flag = 256;
+            abi.ok = true;
+        }
+        return abi;
     }
-    return flags;
+    if (equals(system, "Darwin")) {
+        // Darwin reports the architecture as "arm64", not "aarch64".
+        if (equals(machine, "x86_64") || equals(machine, "arm64")) {
+            abi.directory = 17826048;
+            abi.read_file = 16777476;
+            abi.create_file = 16780033;
+            abi.stat_mode_offset = 4;
+            abi.nofollow_flag = 32;
+            abi.ok = true;
+        }
+        return abi;
+    }
+    return abi;
 }
 
 // ---------------------------------------------------------------------------
@@ -89,9 +130,6 @@ pub fun linux_open_flags(system: string, machine: string) <OpenFlags> {
 #[llvm_name="CloseHandle"]
 @define platform_close_handle(handle: long) <int>;
 
-#[llvm_name="GetFileType"]
-@define platform_file_type(handle: long) <uint>;
-
 #[llvm_name="GetFileAttributesA"]
 @define platform_file_attributes(path: string) <uint>;
 
@@ -102,7 +140,7 @@ pub fun linux_open_flags(system: string, machine: string) <OpenFlags> {
 @define platform_flush(handle: long) <int>;
 
 #[llvm_name="MoveFileExA"]
-@define platform_rename(from: string, to: string, flags: uint) <int>;
+@define platform_rename(source: string, dest: string, flags: uint) <int>;
 
 #[llvm_name="DeleteFileA"]
 @define platform_unlink(path: string) <int>;
@@ -125,23 +163,34 @@ pub fun linux_open_flags(system: string, machine: string) <OpenFlags> {
 #[llvm_name="WriteFile"]
 @define platform_write(handle: long, buffer: &char, count: uint, written: &uint, overlapped: &void) <int>;
 
+pub fun windows_directory(handle: DirHandle) <bool> {
+    let info <[char]> = new [char, 64]{};
+    let result <int> = platform_file_info(handle, &info[0]);
+    let attributes <int> = (cast<int>(info[0]) & 255) + (cast<int>(info[1]) & 255) * 256;
+    delete info;
+    return result != 0 && (attributes & 16) != 0 && (attributes & 1024) == 0;
+}
+
 // The path of a directory handle, so a file inside it can be named.
 pub fun directory_path(handle: DirHandle) <string> {
     let buffer <[char]> = new [char, 32768]{};
     let length <uint> = platform_final_path(handle, &buffer[0], cast<uint>(32767), 0);
     if (length == 0 || length >= cast<uint>(32767)) { delete buffer; return ""; }
-    let text <string> = from_chars(buffer, 0, cast<int>(length));
+    let start <int> = 0;
+    if (length >= cast<uint>(4) && buffer[0] == '\\' && buffer[1] == '\\' && buffer[2] == '?' && buffer[3] == '\\') { start = 4; }
+    let text <string> = from_chars(buffer, start, cast<int>(length) - start);
     delete buffer;
     return text;
 }
 #c_else
-// POSIX: the descriptor and the *at family. O_NOFOLLOW and O_DIRECTORY are
-// architecture-specific on Linux, so the flags come from detect_open_flags.
+// POSIX: the descriptor and the *at family. The flags and the stat layout
+// are the target's, so they come from the ABI record rather than from a
+// constant here.
 #[llvm_name="openat"]
-@define platform_openat(dir: int, path: string, flags: int, mode: int) <int>;
+@define platform_openat(dir: int, path: string, flags: int, ...) <int>;
 
 #[llvm_name="open"]
-@define platform_open(path: string, flags: int, mode: int) <int>;
+@define platform_open(path: string, flags: int, ...) <int>;
 
 #[llvm_name="close"]
 @define platform_close(fd: int) <int>;
@@ -164,8 +213,27 @@ pub fun directory_path(handle: DirHandle) <string> {
 #[llvm_name="mkdirat"]
 @define platform_mkdirat(dir: int, path: string, mode: int) <int>;
 
+#c_ifdef FIN_TARGET_DARWIN
+#c_ifdef FIN_TARGET_X86_64
+#[llvm_name="fstatat$INODE64"]
+#c_else
 #[llvm_name="fstatat"]
+#c_endif
+#c_else
+#[llvm_name="fstatat"]
+#c_endif
 @define platform_fstatat(dir: int, path: string, info: &char, flags: int) <int>;
+
+#c_ifdef FIN_TARGET_DARWIN
+#c_ifdef FIN_TARGET_X86_64
+#[llvm_name="fstat$INODE64"]
+#c_else
+#[llvm_name="fstat"]
+#c_endif
+#c_else
+#[llvm_name="fstat"]
+#c_endif
+@define platform_fstat(fd: int, info: &char) <int>;
 
 #[llvm_name="uname"]
 @define platform_uname(buffer: &char) <int>;
@@ -174,44 +242,65 @@ pub fun directory_path(handle: DirHandle) <string> {
 @define platform_pid() <int>;
 
 // The path of a directory descriptor, so a file inside it can be named.
+//
+// Linux answers through /proc. Darwin has no procfs, and asks the kernel
+// for the path of the descriptor instead (F_GETPATH).
+#c_ifdef FIN_TARGET_DARWIN
+#[llvm_name="fcntl"]
+@define platform_fcntl(fd: int, command: int, ...) <int>;
+pub fun directory_path(handle: DirHandle) <string> {
+    let buffer <[char]> = new [char, 1024]{};
+    let status <int> = platform_fcntl(handle, 50, &buffer[0]); // F_GETPATH
+    if (status < 0) { delete buffer; return ""; }
+    let used <int> = 0;
+    while (used < 1023 && buffer[used] != cast<char>(0)) { used++; }
+    let text <string> = from_chars(buffer, 0, used);
+    delete buffer;
+    return text;
+}
+#c_else
 pub fun directory_path(handle: DirHandle) <string> {
     let path <string> = format!("/proc/self/fd/{}", handle);
     return path;
 }
 #c_endif
+#c_endif
 
-#c_ifdef FIN_TARGET_WINDOWS
 // What a name inside a directory is, without following it: 1 a regular file,
-// 0 not there, -1 something else. A reparse point -- a symlink or a junction
-// -- is "something else", because it is never followed.
-pub fun name_kind(dir: DirHandle, name: string) <int> {
+// 0 not there, -1 something else. A symlink is "something else", because it
+// is never followed.
+#c_ifdef FIN_TARGET_WINDOWS
+// A reparse point -- a symlink or a junction -- is refused, and so is a
+// directory: only a regular file may be published.
+pub fun name_kind(dir: DirHandle, name: string, abi: TargetAbi) <int> {
     let base <string> = directory_path(dir);
-    let path <string> = concat(base, concat("\\", name));
-    free_str(base);
+    let separator <string> = concat(base, "\\");
+    let path <string> = concat(separator, name);
+    free_str(separator); free_str(base);
     let attributes <uint> = platform_file_attributes(path);
     free_str(path);
-    if (attributes == cast<uint>(-1)) { return 0; }
-    // FILE_ATTRIBUTE_DIRECTORY is 0x10 and FILE_ATTRIBUTE_REPARSE_POINT is
-    // 0x400.
-    if ((attributes & 0x10) != cast<uint>(0)) { return -1; }
-    if ((attributes & 0x400) != cast<uint>(0)) { return -1; }
+    if (attributes == cast<uint>(-1)) {
+        let missing <bool> = platform_error_is_missing();
+        if (missing) { return 0; }
+        return -1;
+    }
+    if ((attributes & cast<uint>(1040)) != cast<uint>(0)) { return -1; }
     return 1;
 }
 #c_else
-// What a name inside a directory is, without following it: 1 a regular file,
-// 0 not there, -1 something else. AT_SYMLINK_NOFOLLOW reports a symlink
-// rather than the file it points at, which is the whole point: a symlink is
-// "something else", because it is never followed.
-pub fun name_kind(dir: DirHandle, name: string) <int> {
+// AT_SYMLINK_NOFOLLOW reports a symlink rather than the file it points at,
+// which is the whole point: a symlink is "something else", because it is
+// never followed. The flag's value is the target's.
+pub fun name_kind(dir: DirHandle, name: string, abi: TargetAbi) <int> {
     let info <[char]> = new [char, 256]{};
-    let status <int> = platform_fstatat(dir, name, &info[0], 256);
+    let status <int> = platform_fstatat(dir, name, &info[0], abi.nofollow_flag);
     if (status < 0) {
         let missing <bool> = *platform_errno() == error_file_not_found();
         delete info;
         if (missing) { return 0; }
         return -1;
     }
-    let mode <int> = (cast<int>(info[24]) & 255) + (cast<int>(info[25]) & 255) * 256;
+    let mode <int> = stat_mode(info, abi.stat_mode_offset);
     delete info;
     // S_IFMT is 0170000 and S_IFLNK is 0120000; a regular file is 0100000.
     let kind <int> = mode & 61440;
@@ -256,18 +345,26 @@ pub type FileHandle = int;
 // Opens a directory by path, refusing to follow a symlink at the last
 // component. The path is walked component by component so that a symlink
 // anywhere in the path is refused, not only at the end.
-pub fun platform_open_directory(path: string, create: bool) <DirHandle> {
+pub fun platform_open_directory(path: string, create: bool, abi: TargetAbi) <DirHandle> {
     let invalid <DirHandle> = -1;
+    if (!abi.ok) { return invalid; }
     let chars <[char]> = to_chars(path);
     let total <int> = chars.length - 1;
     if (total == 0) { delete chars; return invalid; }
-    // The handle of the current directory, and the path of it, so each
-    // component can be opened relative to the last.
-    let current <string> = ".";
-    if (chars[0] == '/' || chars[0] == '\\') { current = "\\"; }
-    let handle <DirHandle> = platform_create_file(current, 0, 7, null, 3, 0x02000000 | 0x00200000, null);
-    if (handle == invalid) { delete chars; return invalid; }
+    let current <string> = clone(".");
     let i <int> = 0;
+    if (total >= 3 && chars[1] == ':' && (chars[2] == '/' || chars[2] == '\\')) {
+        free_str(current); current = from_chars(chars, 0, 3); i = 3;
+    } else if (chars[0] == '/' || chars[0] == '\\') {
+        free_str(current); current = clone("\\"); i = 1;
+        if (total > 1 && (chars[1] == '/' || chars[1] == '\\')) {
+            free_str(current); delete chars; return invalid;
+        }
+    }
+    let handle <DirHandle> = platform_create_file(current, 0, 3, null, 3, cast<uint>(35651584), null);
+    free_str(current);
+    if (handle == invalid) { delete chars; return invalid; }
+    if (!windows_directory(handle)) { platform_close_handle(handle); delete chars; return invalid; }
     while (handle != invalid && i < total) {
         while (i < total && (chars[i] == '/' || chars[i] == '\\')) { i++; }
         let start <int> = i;
@@ -277,12 +374,17 @@ pub fun platform_open_directory(path: string, create: bool) <DirHandle> {
         if (equals(part, ".")) { free_str(part); continue; }
         if (equals(part, "..")) { free_str(part); platform_close_handle(handle); return invalid; }
         let base <string> = directory_path(handle);
-        let child <string> = concat(base, concat("\\", part));
-        free_str(base); free_str(part);
-        let next <DirHandle> = platform_create_file(child, 0, 7, null, 3, 0x02000000 | 0x00200000, null);
-        if (next == invalid && create) {
+        let separator <string> = concat(base, "\\");
+        let child <string> = concat(separator, part);
+        free_str(base); free_str(separator); free_str(part);
+        let next <DirHandle> = platform_create_file(child, 0, 3, null, 3, cast<uint>(35651584), null);
+        if (next == invalid && create && platform_error_is_missing()) {
             platform_mkdir(child, null);
-            next = platform_create_file(child, 0, 7, null, 3, 0x02000000 | 0x00200000, null);
+            next = platform_create_file(child, 0, 3, null, 3, cast<uint>(35651584), null);
+        }
+        free_str(child);
+        if (next != invalid && !windows_directory(next)) {
+            platform_close_handle(next); next = invalid;
         }
         platform_close_handle(handle);
         handle = next;
@@ -294,15 +396,15 @@ pub fun platform_open_directory(path: string, create: bool) <DirHandle> {
 // Opens a directory by path, refusing to follow a symlink in any component.
 // '..' is refused outright: a path that walks up is not a path the caller
 // named.
-pub fun platform_open_directory(path: string, create: bool, flags: OpenFlags) <DirHandle> {
+pub fun platform_open_directory(path: string, create: bool, abi: TargetAbi) <DirHandle> {
     let invalid <DirHandle> = -1;
-    if (!flags.ok) { return invalid; }
+    if (!abi.ok) { return invalid; }
     let chars <[char]> = to_chars(path);
     let total <int> = chars.length - 1;
     if (total == 0) { delete chars; return invalid; }
     let base <string> = ".";
     if (chars[0] == '/') { base = "/"; }
-    let handle <DirHandle> = platform_open(base, flags.directory, 0);
+    let handle <DirHandle> = platform_open(base, abi.directory, 0);
     let i <int> = 0;
     while (handle != invalid && i < total) {
         while (i < total && chars[i] == '/') { i++; }
@@ -312,10 +414,10 @@ pub fun platform_open_directory(path: string, create: bool, flags: OpenFlags) <D
         let part <string> = from_chars(chars, start, i - start);
         if (equals(part, ".")) { free_str(part); continue; }
         if (equals(part, "..")) { free_str(part); platform_close(handle); return invalid; }
-        let next <DirHandle> = platform_openat(handle, part, flags.directory, 0);
-        if (next == invalid && create && *platform_errno() == 2) {
+        let next <DirHandle> = platform_openat(handle, part, abi.directory, 0);
+        if (next == invalid && create && *platform_errno() == error_file_not_found()) {
             platform_mkdirat(handle, part, 493);
-            next = platform_openat(handle, part, flags.directory, 0);
+            next = platform_openat(handle, part, abi.directory, 0);
         }
         free_str(part);
         platform_close(handle);
@@ -334,52 +436,56 @@ pub fun platform_open_directory(path: string, create: bool, flags: OpenFlags) <D
 // Opens a file inside a directory, refusing to follow a symlink at the name.
 // The name is joined to the directory's own path, because Windows has no
 // openat. `create` says whether the file is being made or read.
-pub fun open_in_directory(dir: DirHandle, name: string, create: bool) <FileHandle> {
-    let invalid <FileHandle> = -1;
+pub fun open_in_directory(dir: DirHandle, name: string, create: bool, abi: TargetAbi) <FileHandle> {
     let base <string> = directory_path(dir);
-    let path <string> = concat(base, concat("\\", name));
-    free_str(base);
-    // GENERIC_READ for a read, GENERIC_WRITE for a creation; the disposition
-    // says whether the file must exist or must not.
-    let access <uint> = 0x80000000;
+    let separator <string> = concat(base, "\\");
+    let path <string> = concat(separator, name);
+    free_str(separator); free_str(base);
+    // GENERIC_READ is 2147483648 and GENERIC_WRITE is 1073741824; the
+    // disposition says whether the file must exist or must not.
+    let access <uint> = 2147483648;
     let disposition <uint> = 3;
-    if (create) { access = 0x40000000; disposition = 1; }
-    let handle <FileHandle> = platform_create_file(path, access, 7, null, disposition, 0x02000000 | 0x00200000, null);
+    if (create) { access = 1073741824; disposition = 1; }
+    let handle <FileHandle> = platform_create_file(path, access, 3, null, disposition, cast<uint>(35651584), null);
     free_str(path);
     return handle;
 }
 
 // Whether the handle is a regular file. A directory handle and a reparse
 // point are not.
-pub fun is_regular_file(handle: FileHandle) <bool> {
+pub fun is_regular_file(handle: FileHandle, abi: TargetAbi) <bool> {
     let info <[char]> = new [char, 256]{};
     if (platform_file_info(handle, &info[0]) == 0) { delete info; return false; }
-    // The attributes are at offset 32 of the BY_HANDLE_FILE_INFORMATION
-    // structure, and FILE_ATTRIBUTE_DIRECTORY is 0x10.
-    let attributes <int> = (cast<int>(info[32]) & 255) + (cast<int>(info[33]) & 255) * 256;
+    // The attributes are the first field of the BY_HANDLE_FILE_INFORMATION
+    // structure, and FILE_ATTRIBUTE_DIRECTORY is 16.
+    let attributes <int> = (cast<int>(info[0]) & 255) + (cast<int>(info[1]) & 255) * 256;
     delete info;
-    if ((attributes & 16) == 16) { return false; }
+    if ((attributes & 1040) != 0) { return false; }
     return true;
 }
 #c_else
+// The low mode bits are little-endian on the supported targets.
+pub fun stat_mode(info: [char], offset: int) <int> {
+    blame offset >= 0 && offset + 1 < info.length;
+    return (cast<int>(info[offset]) & 255) + (cast<int>(info[offset + 1]) & 255) * 256;
+}
+
 // Opens a file inside a directory, relative to the directory descriptor, so
 // the name cannot be redirected by a concurrent rename of the parent.
-pub fun open_in_directory(dir: DirHandle, name: string, create: bool, flags: OpenFlags) <FileHandle> {
+pub fun open_in_directory(dir: DirHandle, name: string, create: bool, abi: TargetAbi) <FileHandle> {
     if (create) {
         // WRONLY|CREAT|EXCL, mode 0644 respects the umask.
-        return platform_openat(dir, name, flags.create_file, 420);
+        return platform_openat(dir, name, abi.create_file, 420);
     }
-    return platform_openat(dir, name, flags.read_file, 0);
+    return platform_openat(dir, name, abi.read_file, 0);
 }
 
 // Whether the descriptor is a regular file. The mode is the st_mode field of
 // the stat structure, and S_IFREG is 0100000.
-pub fun is_regular_file(handle: FileHandle) <bool> {
+pub fun is_regular_file(handle: FileHandle, abi: TargetAbi) <bool> {
     let info <[char]> = new [char, 256]{};
-    // AT_EMPTY_PATH asks about the descriptor itself rather than a name.
-    let status <int> = platform_fstatat(handle, "", &info[0], 4096);
-    if (status < 0) { delete info; return false; }
-    let mode <int> = (cast<int>(info[24]) & 255) + (cast<int>(info[25]) & 255) * 256;
+    if (platform_fstat(handle, &info[0]) != 0) { delete info; return false; }
+    let mode <int> = stat_mode(info, abi.stat_mode_offset);
     delete info;
     if ((mode & 61440) == 32768) { return true; }
     return false;
@@ -403,17 +509,18 @@ pub fun file_write(handle: FileHandle, buffer: &char, count: int) <int> {
     return cast<int>(written);
 }
 
-pub fun file_flush(handle: FileHandle) <bool> { return platform_flush(handle) == 0; }
+pub fun file_flush(handle: FileHandle) <bool> { return platform_flush(handle) != 0; }
 
-pub fun file_close(handle: FileHandle) <bool> { return platform_close_handle(handle) == 0; }
+pub fun file_close(handle: FileHandle) <bool> { return platform_close_handle(handle) != 0; }
 
 // Renames a file into place. MOVEFILE_REPLACE_EXISTING replaces the
 // destination, which is what replacing an output file means.
 pub fun rename_in_directory(dir: DirHandle, old_name: string, dest: string) <bool> {
     let base <string> = directory_path(dir);
-    let from_path <string> = concat(base, concat("\\", old_name));
-    let dest_path <string> = concat(base, concat("\\", dest));
-    free_str(base);
+    let separator <string> = concat(base, "\\");
+    let from_path <string> = concat(separator, old_name);
+    let dest_path <string> = concat(separator, dest);
+    free_str(separator); free_str(base);
     let ok <bool> = platform_rename(from_path, dest_path, 1) != 0;
     free_str(from_path);
     free_str(dest_path);
@@ -422,8 +529,9 @@ pub fun rename_in_directory(dir: DirHandle, old_name: string, dest: string) <boo
 
 pub fun unlink_in_directory(dir: DirHandle, name: string) <bool> {
     let base <string> = directory_path(dir);
-    let path <string> = concat(base, concat("\\", name));
-    free_str(base);
+    let separator <string> = concat(base, "\\");
+    let path <string> = concat(separator, name);
+    free_str(separator); free_str(base);
     let ok <bool> = platform_unlink(path) != 0;
     free_str(path);
     return ok;
@@ -461,28 +569,40 @@ pub fun unlink_in_directory(dir: DirHandle, name: string) <bool> {
 pub fun directory_flush(dir: DirHandle) <bool> { return platform_fsync(dir) == 0; }
 #c_endif
 
-// The flags the running host uses. The Linux numbers come from the
-// architecture; the other targets have their own constants.
-pub fun detect_open_flags() <OpenFlags> {
+// The ABI of the running host. The Linux and Darwin numbers come from the
+// architecture the kernel reports; Windows has its own constants.
+//
+// The uname record's field widths differ: Linux keeps 65 bytes per field
+// with the machine at byte 260, Darwin keeps 256 with the machine at byte
+// 1024. Reading the wrong offset reads a different field, and reading past
+// the end of a short buffer is a memory error, so both are selected here.
+pub fun detect_target_abi() <TargetAbi> {
     #c_ifdef FIN_TARGET_WINDOWS
     // FILE_FLAG_BACKUP_SEMANTICS is what lets a directory be opened at all.
     // FILE_FLAG_OPEN_REPARSE_POINT refuses to follow a symlink, which is what
     // the nofollow check needs.
-    return OpenFlags{directory: 0x02000000, read_file: 0x02000000, create_file: 0x02000000, ok: true};
+    return TargetAbi{directory: 33554432, read_file: 33554432, create_file: 33554432, stat_mode_offset: 0, nofollow_flag: 0, ok: true};
     #c_else
-    let info <[char]> = new [char, 390]{};
-    if (platform_uname(&info[0]) != 0) { delete info; return OpenFlags{directory: 0, read_file: 0, create_file: 0, ok: false}; }
+    #c_ifdef FIN_TARGET_DARWIN
+    let size <int> = 1280;
+    let machine_at <int> = 1024;
+    #c_else
+    let size <int> = 390;
+    let machine_at <int> = 260;
+    #c_endif
+    let info <[char]> = new [char, size]{};
+    if (platform_uname(&info[0]) != 0) { delete info; return TargetAbi{directory: 0, read_file: 0, create_file: 0, stat_mode_offset: 0, nofollow_flag: 0, ok: false}; }
     let system_end <int> = 0;
     while (system_end < 65 && info[system_end] != cast<char>(0)) { system_end++; }
-    let machine_end <int> = 260;
-    while (machine_end < 325 && info[machine_end] != cast<char>(0)) { machine_end++; }
-    if (system_end == 65 || machine_end == 325) { delete info; return OpenFlags{directory: 0, read_file: 0, create_file: 0, ok: false}; }
+    let machine_end <int> = machine_at;
+    while (machine_end < machine_at + 65 && info[machine_end] != cast<char>(0)) { machine_end++; }
+    if (system_end == 65 || machine_end == machine_at + 65) { delete info; return TargetAbi{directory: 0, read_file: 0, create_file: 0, stat_mode_offset: 0, nofollow_flag: 0, ok: false}; }
     let system <string> = from_chars(info, 0, system_end);
-    let machine <string> = from_chars(info, 260, machine_end - 260);
-    let flags <OpenFlags> = linux_open_flags(system, machine);
-    if (!flags.ok) { printf("error: unsupported platform %s/%s (requires Linux x86_64 or aarch64)\n", system, machine); }
+    let machine <string> = from_chars(info, machine_at, machine_end - machine_at);
+    let abi <TargetAbi> = posix_abi(system, machine);
+    if (!abi.ok) { printf("error: unsupported platform %s/%s (requires Linux or Darwin on x86_64 or arm64)\n", system, machine); }
     free_str(system); free_str(machine); delete info;
-    return flags;
+    return abi;
     #c_endif
 }
 

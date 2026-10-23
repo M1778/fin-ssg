@@ -20,10 +20,12 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def run(command, cwd=None, env=None, check=True):
     result = subprocess.run([str(part) for part in command], cwd=cwd, env=env,
-                            text=True, capture_output=True, timeout=300)
+                            text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=300)
     if check and result.returncode != 0:
         raise SystemExit(f"command failed ({result.returncode}): {' '.join(str(p) for p in command)}\n"
                          f"{result.stdout}\n{result.stderr}")
+    print(result.stdout, end="", flush=True)
+    print(result.stderr, end="", flush=True)
     return result
 
 
@@ -51,7 +53,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--finc", default=os.environ.get("FINC", "finc"))
     parser.add_argument("--fin-libs", default=os.environ.get("FIN_LIBS", ""))
-    parser.add_argument("--opt", default=os.environ.get("OPT", "-O0"))
+    # The optimization level starts with a dash, so it is taken with an
+    # equals sign or as the next argument; "--opt -O0" would be read as a
+    # flag.
+    parser.add_argument("--opt", default=os.environ.get("OPT", "-O0"),
+                        help="the optimization level, for example -O0 or -O2")
     options = parser.parse_args()
 
     compiler = shutil.which(options.finc) or options.finc
@@ -59,11 +65,14 @@ def main():
     vendor = ROOT / "src" / "vendor"
 
     with tempfile.TemporaryDirectory(prefix="fin-ssg-") as directory:
-        work = Path(directory)
+        work = Path(directory).resolve()
         binary = work / ("fin-ssg.exe" if os.name == "nt" else "fin-ssg")
 
         print("== frontend check ==", flush=True)
-        run([compiler, "-I", vendor, ROOT / "src" / "main.fin"], cwd=ROOT)
+        frontend = [compiler, "-I", vendor]
+        if stdlib:
+            frontend += ["--fin-libs", stdlib]
+        run([*frontend, ROOT / "src" / "main.fin"], cwd=ROOT)
 
         print(f"== codegen + link {options.opt} ==", flush=True)
         build(compiler, stdlib, ROOT / "src" / "main.fin", binary, [options.opt])

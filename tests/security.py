@@ -2,11 +2,12 @@
 from pathlib import Path
 from html.parser import HTMLParser
 import os
-import resource
 import signal
 import subprocess
 import sys
 import time
+if os.name != 'nt':
+    import resource
 from urllib.parse import quote
 
 BIN = Path(sys.argv[1]).resolve()
@@ -77,7 +78,7 @@ for index, url in enumerate(unsafe):
     attack += f'[unsafe{index}]({url})\n\n'
 (content / 'attack.md').write_text(attack)
 (content / 'normal.md').write_text('# Normal page\n\nA normal **link target**.\n')
-weird_name = 'x" onmouseover="window.__ssgExecuted=1 #?ü\n.md'
+weird_name = "x' quoted #.md" if os.name == 'nt' else 'x" onmouseover="window.__ssgExecuted=1 #?ü\n.md'
 (content / weird_name).write_text('# Filename\n')
 out = WORK / "output 'quoted'"
 run(content, out, '--title', '{{title}}', layout=layout)
@@ -113,9 +114,12 @@ assert not (WORK / 'reserved-out').exists()
 run(reserved, WORK / 'reserved-out', code=1)
 (reserved / 'INDEX.md').unlink()
 (reserved / 'Page.md').touch()
-(reserved / 'page.md').touch()
-run(reserved, WORK / 'reserved-out', code=1)
-assert not (WORK / 'reserved-out').exists()
+if not (reserved / 'page.md').exists():
+    (reserved / 'page.md').touch()
+    run(reserved, WORK / 'reserved-out', code=1)
+    assert not (WORK / 'reserved-out').exists()
+else:
+    print('SKIP case-collision fixture: case-insensitive filesystem')
 sentinel = WORK / 'sentinel.txt'
 sentinel.write_text('KEEP')
 linkout = WORK / 'symlink-out'
@@ -138,7 +142,11 @@ run(content, WORK / '..' / 'must-not-create', code=1)
 unsafe_content = WORK / 'unsafe-content'
 unsafe_content.mkdir()
 (unsafe_content / 'link.md').symlink_to(sentinel)
-os.mkfifo(unsafe_content / 'fifo.md')
+if hasattr(os, 'mkfifo'):
+    os.mkfifo(unsafe_content / 'fifo.md')
+else:
+    (unsafe_content / 'directory.md').mkdir()
+    print('SKIP FIFO fixture: unsupported on Windows; directory refusal still tested')
 run(unsafe_content, WORK / 'unsafe-out', code=2)
 assert 'KEEP' not in (WORK / 'unsafe-out/index.html').read_text()
 assert sentinel.read_text() == 'KEEP'
@@ -158,18 +166,21 @@ write_out = WORK / 'write-out'
 write_out.mkdir()
 (write_out / 'page.html').write_text('ORIGINAL')
 
-def restrict_file_size():
-    signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
-    resource.setrlimit(resource.RLIMIT_FSIZE, (512, 512))
+if os.name != 'nt':
+    def restrict_file_size():
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (512, 512))
 
-result = subprocess.run(
-    [str(BIN), '--content', str(write_content), '--layout', str(WORK / 'missing'),
-     '--out', str(write_out)], capture_output=True, timeout=10,
-    preexec_fn=restrict_file_size,
-)
-assert result.returncode != 0
-assert (write_out / 'page.html').read_text() == 'ORIGINAL'
-assert not list(write_out.glob('.fin-ssg-*.tmp'))
+    result = subprocess.run(
+        [str(BIN), '--content', str(write_content), '--layout', str(WORK / 'missing'),
+         '--out', str(write_out)], capture_output=True, timeout=10,
+        preexec_fn=restrict_file_size,
+    )
+    assert result.returncode != 0
+    assert (write_out / 'page.html').read_text() == 'ORIGINAL'
+    assert not list(write_out.glob('.fin-ssg-*.tmp'))
+else:
+    print('SKIP RLIMIT_FSIZE short-write injection: unavailable on Windows')
 
 # Full line scan; controlled resource failures never publish truncated text.
 long_content = WORK / 'long-content'
@@ -197,7 +208,12 @@ run(long_content, expanded_out, code=2, layout=expansion_layout)
 assert (expanded_out / 'long.html').read_text() == 'OLD PAGE'
 
 # Arg and file limits must reject rather than silently discard the suffix.
-for args in (['--title', 'x' * 66000], ['--help'] * 257, ['unexpected']):
+argument_cases = [['--help'] * 257, ['unexpected']]
+if os.name != 'nt':
+    argument_cases.append(['--title', 'x' * 66000])
+else:
+    print('SKIP 66 KiB argv fixture: exceeds Windows process command-line limit')
+for args in argument_cases:
     result = subprocess.run([str(BIN), *args], capture_output=True, timeout=10)
     assert result.returncode == 1
 many = WORK / 'many'

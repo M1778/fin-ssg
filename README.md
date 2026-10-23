@@ -11,9 +11,13 @@ language" demo — think a tiny Hugo.
 > Linux hosts after correcting the architecture-specific open flags.
 > The generator remains entirely Fin; Python 3 is used only for black-box tests.
 >
-> The filesystem layer now selects its calls for the native target, so macOS and
-> Windows are compiled from the same source as Linux. What is verified natively
-> is stated per platform below; the Linux behaviour is unchanged.
+> The filesystem layer selects native Linux, macOS and Windows calls. The
+> The pushed portability revision passed O0/O2 smoke/security/filesystem tests
+> on all six native hosts—Linux, macOS and Windows, each on x86_64 and ARM64—in
+> [native matrix 40034937084](https://github.com/M1778/fin-sdk/actions/runs/40034937084).
+> The compiler is externally verified candidate
+> `5360b051b8e82a4f10052c3dbb77bc66cc727cd7` from CI run `40028977601`, not a
+> released version. Platform-specific test skips and durability limits remain below.
 
 ## What it does
 
@@ -120,7 +124,10 @@ stays literal and cannot introduce another substitution.
   are replaced through exclusive same-directory temporary files, checked writes,
   `fsync`, close and descriptor-relative rename. Existing hardlinks are replaced,
   not truncated. Atomicity is **per file**, not an all-or-nothing site transaction;
-  partial successes remain on a later failure. No stale-output cleanup is done.
+  partial successes remain on a later failure. Windows uses checked native
+  file flush/close and same-directory rename but has no separate directory-fsync
+  guarantee. Windows narrow paths use the system code page; UNC input roots
+  are currently refused. No stale-output cleanup is done.
 - Limits: 256 arguments / 65,536 total argv bytes (including executable name),
   4,096 Markdown files, 4 MiB per input/layout, 32 MiB per rendered output/index.
   Limits fail explicitly. There is no line-count limit; empty option values and
