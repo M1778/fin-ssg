@@ -6,10 +6,11 @@ version = "0.1.0"
 envpath = ".finn"
 entrypoint = "main.fin"
 
-# fin-markdown does not exist yet and M1778/template is a project scaffold,
-# not a templating engine — so the Markdown renderer and the {{key}} template
-# engine are vendored under src/vendor/ (marked for replacement). No
-# [packages] until the real libraries land.
+# fin-markdown + fin-template are adopted as vendored copies under
+# src/vendor/ (fin-markdown v0.1.0 + fin-ssg hardening; fin-template
+# v0.1.0 via tpl_render). No [packages] until the finn registry resolves
+# bare names; the import spellings already match, so that switch needs
+# no code change.
 
 [scripts]
 check = "finc -I src/vendor src/main.fin"

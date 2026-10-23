@@ -1,38 +1,1029 @@
-// VENDORED — single-pass {{key}} rendering. Inserted values are never parsed.
-// Metadata is escaped for text/quoted-attribute contexts; content is trusted
-// renderer output. Layout files themselves must be trusted HTML, not user input.
-import { to_chars } from strings::std;
-import { TextBuffer, text_buffer, text_char, text_append, text_range, text_finish, md_escape_into } from markdown::fin;
+// ADOPTED 2026-10-23: fin-template v0.1.0 (M1778/fin-template, builder-2 copy).
+// Replaces the vendored single-pass {{key}} engine. tpl_render signature
+// unchanged; deltas vs the old engine: (1) returns "" (not null) on render
+// failure; (2) {{ title }} spacing is normalised; unknown placeholders stay
+// as {{name}}. Callers MUST pass raw (unescaped) metadata — the engine
+// auto-escapes site_title/title/date and passes content through |safe.
+// SPDX-License-Identifier: MIT
+// fin-template v0.1.0 — an HTML templating engine for Fin.
+//
+// Syntax:
+//   {{ name }}                  variable (auto-escaped; |safe to opt out)
+//   {{ user.name }}             dotted lookup (flat keys: ctx_set "user.name")
+//   {{ items|length }}          filters: upper, lower, title, trim, escape,
+//   {{ name|default("guest") }}   safe, default, length, first, last, join,
+//                                 reverse
+//   {% if user %}...{% elif %}...{% else %}...{% endif %}
+//   {% if not admin %}...{% endif %}
+//   {% if role == "admin" %}...{% endif %}
+//   {% for item in items %}...{% endfor %}   (+ loop.index/loop.index0/
+//                                            loop.first/loop.last/loop.length)
+//   {% block title %}...{% endblock %}
+//   {% extends "layout.html" %}
+//   {# comment #}               removed from output
+//
+// Design decisions (see README.md):
+// - Context is a flat key/value store (strings + string lists), the same
+//   shape fin-validate proved on finc 0.4.0. No object model: dotted keys
+//   are set with ctx_set(ctx, "user.name", ...) and looked up verbatim.
+// - Unknown {{variables}} are left untouched ({{name}}, whitespace
+//   normalised) — this matches the vendored engine fin-ssg used, so
+//   layouts migrate without losing placeholders.
+// - Unknown tags and unclosed constructs degrade to literal text; render
+//   never aborts on template-author mistakes. Only a missing extends parent
+//   is a hard RenderResult error.
+// - Auto-escaping is ON by default. Pre-rendered HTML must use |safe.
+
+import { to_chars, from_chars, concat, substr, trim, len, starts_with, ends_with, equals, parse_int, replace } from strings::std;
+import { Collection } from collection::std;
+import { read_to_string } from fs::std;
+
 namespace fin {
-fun tpl_key(chars: [char], start: int, end: int, key: string) <bool> {
-    let token <[char]> = to_chars(key);
-    let same <bool> = end - start == token.length - 1;
-    for (let i <int> = 0; same && i < token.length - 1; i++) {
-        if (chars[start + i] != token[i]) { same = false; }
-    }
-    delete token;
-    return same;
+
+// ---------------------------------------------------------------------------
+// Small string helpers (private; std only where the import is proven)
+// ---------------------------------------------------------------------------
+
+priv fun slen(s: string) <int> {
+    return len(s);
 }
 
-pub fun? tpl_render(tpl: string, site_title: string, title: string, date: string, content: string) <string> {
-    let chars <[char]> = to_chars(tpl);
-    let total <int> = chars.length - 1;
-    let out <TextBuffer> = text_buffer();
-    let i <int> = 0;
-    while (i < total && out.ok) {
-        if (i + 1 < total && chars[i] == '{' && chars[i + 1] == '{') {
-            let close <int> = i + 2;
-            while (close + 1 < total && !(chars[close] == '}' && chars[close + 1] == '}')) { close++; }
-            if (close + 1 >= total) { text_range(&out, chars, i, total); break; }
-            if (tpl_key(chars, i + 2, close, "site_title")) { md_escape_into(&out, site_title); }
-            else if (tpl_key(chars, i + 2, close, "title")) { md_escape_into(&out, title); }
-            else if (tpl_key(chars, i + 2, close, "date")) { md_escape_into(&out, date); }
-            else if (tpl_key(chars, i + 2, close, "content")) { text_append(&out, content); }
-            else { text_range(&out, chars, i, close + 2); }
-            i = close + 2;
-        } else { text_char(&out, chars[i]); i++; }
-    }
-    delete chars;
-    return text_finish(&out);
+priv fun str_eq(a: string, b: string) <bool> {
+    return equals(a, b);
 }
+
+priv fun is_space(c: char) <bool> {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+priv fun is_digit(c: char) <bool> {
+    return c >= '0' && c <= '9';
+}
+
+priv fun is_alpha(c: char) <bool> {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+// Slice [a, b) with clamping; never blames.
+priv fun slice_str(s: string, a: int, b: int) <string> {
+    let n <int> = slen(s);
+    let lo <int> = a;
+    let hi <int> = b;
+    if (lo < 0) { lo = 0; }
+    if (hi > n) { hi = n; }
+    if (hi < lo) { hi = lo; }
+    if (lo > n) { return ""; }
+    return substr(s, lo, hi - lo);
+}
+
+// First index of the two-char sequence (c0, c1) at or after `from`, else -1.
+priv fun scan2(s: string, from_idx: int, c0: char, c1: char) <int> {
+    let cs <[char]> = to_chars(s);
+    let n <int> = cs.length - 1;
+    let i <int> = from_idx;
+    let hit <int> = -1;
+    while (i + 1 < n) {
+        if (cs[i] == c0 && cs[i + 1] == c1) { hit = i; break; }
+        i++;
+    }
+    delete cs;
+    return hit;
+}
+
+priv fun scan_char(s: string, from_idx: int, c: char) <int> {
+    let cs <[char]> = to_chars(s);
+    let n <int> = cs.length - 1;
+    let i <int> = from_idx;
+    let hit <int> = -1;
+    while (i < n) {
+        if (cs[i] == c) { hit = i; break; }
+        i++;
+    }
+    delete cs;
+    return hit;
+}
+
+// Split on whitespace runs; empty parts dropped.
+priv fun split_ws(s: string) <&Collection<string>> {
+    let out <&Collection<string>> = new Collection::<string>{};
+    let cs <[char]> = to_chars(s);
+    let n <int> = cs.length - 1;
+    let i <int> = 0;
+    while (i < n) {
+        while (i < n && is_space(cs[i])) { i++; }
+        if (i >= n) { break; }
+        let start <int> = i;
+        while (i < n && !is_space(cs[i])) { i++; }
+        out.push(from_chars(cs, start, i - start));
+    }
+    delete cs;
+    return out;
+}
+
+// Split on '|' but not inside double quotes (for filter args like "a|b").
+priv fun split_pipes(s: string) <&Collection<string>> {
+    let out <&Collection<string>> = new Collection::<string>{};
+    let cs <[char]> = to_chars(s);
+    let n <int> = cs.length - 1;
+    let i <int> = 0;
+    let in_q <bool> = false;
+    let start <int> = 0;
+    while (i < n) {
+        if (cs[i] == '"') { in_q = !in_q; }
+        if (cs[i] == '|' && !in_q) {
+            out.push(from_chars(cs, start, i - start));
+            start = i + 1;
+        }
+        i++;
+    }
+    out.push(from_chars(cs, start, n - start));
+    delete cs;
+    return out;
+}
+
+// Unquote a "..." literal; returns the inner text, or the input unchanged
+// when it is not a quoted literal.
+priv fun unquote(s: string) <string> {
+    let t <string> = trim(s);
+    let n <int> = slen(t);
+    if (n >= 2 && starts_with(t, "\"") && ends_with(t, "\"")) {
+        return slice_str(t, 1, n - 1);
+    }
+    return t;
+}
+
+priv fun int_to_str(v: int) <string> {
+    if (v == 0) { return "0"; }
+    let neg <bool> = false;
+    let x <int> = v;
+    if (x < 0) { neg = true; x = 0 - x; }
+    let scratch <[char]> = new [char, 12]{};
+    let k <int> = 0;
+    while (x > 0) {
+        scratch[k] = cast<char>(cast<int>('0') + (x - ((x / 10) * 10)));
+        x = x / 10;
+        k++;
+    }
+    let out <string> = "";
+    if (neg) { out = "-"; }
+    let j <int> = k - 1;
+    while (j >= 0) {
+        out = concat(out, from_chars(scratch, j, 1));
+        j--;
+    }
+    delete scratch;
+    return out;
+}
+
+priv fun upper_str(s: string) <string> {
+    let cs <[char]> = to_chars(s);
+    let n <int> = cs.length - 1;
+    for (let i <int> = 0; i < n; i++) {
+        if (cs[i] >= 'a' && cs[i] <= 'z') {
+            cs[i] = cast<char>(cast<int>(cs[i]) - 32);
+        }
+    }
+    let out <string> = from_chars(cs, 0, n);
+    delete cs;
+    return out;
+}
+
+priv fun lower_str(s: string) <string> {
+    let cs <[char]> = to_chars(s);
+    let n <int> = cs.length - 1;
+    for (let i <int> = 0; i < n; i++) {
+        if (cs[i] >= 'A' && cs[i] <= 'Z') {
+            cs[i] = cast<char>(cast<int>(cs[i]) + 32);
+        }
+    }
+    let out <string> = from_chars(cs, 0, n);
+    delete cs;
+    return out;
+}
+
+priv fun reverse_str(s: string) <string> {
+    let cs <[char]> = to_chars(s);
+    let n <int> = cs.length - 1;
+    let out <[char]> = new [char, n + 1]{};
+    for (let i <int> = 0; i < n; i++) {
+        out[i] = cs[n - 1 - i];
+    }
+    out[n] = cast<char>(0);
+    let r <string> = from_chars(out, 0, n);
+    delete cs;
+    delete out;
+    return r;
+}
+
+priv fun title_str(s: string) <string> {
+    let cs <[char]> = to_chars(s);
+    let n <int> = cs.length - 1;
+    let prev_space <bool> = true;
+    for (let i <int> = 0; i < n; i++) {
+        if (is_alpha(cs[i])) {
+            if (prev_space && cs[i] >= 'a' && cs[i] <= 'z') {
+                cs[i] = cast<char>(cast<int>(cs[i]) - 32);
+            }
+            prev_space = false;
+        } else {
+            prev_space = true;
+        }
+    }
+    let out <string> = from_chars(cs, 0, n);
+    delete cs;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// HTML escaping (public utility — fin-ssg used to hand-roll this)
+// ---------------------------------------------------------------------------
+
+#[export]
+pub fun escape_html(s: string) <string> {
+    let cs <[char]> = to_chars(s);
+    let n <int> = cs.length - 1;
+    let out <string> = "";
+    for (let i <int> = 0; i < n; i++) {
+        let c <char> = cs[i];
+        if (c == '&') { out = concat(out, "&amp;"); }
+        else if (c == '<') { out = concat(out, "&lt;"); }
+        else if (c == '>') { out = concat(out, "&gt;"); }
+        else if (c == '"') { out = concat(out, "&quot;"); }
+        else if (c == '\'') { out = concat(out, "&#39;"); }
+        else { out = concat(out, from_chars(cs, i, 1)); }
+    }
+    delete cs;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Context: flat key -> string | string-list store
+// ---------------------------------------------------------------------------
+
+#[export]
+pub struct CtxEntry {
+    pub:
+        key <string>,
+        value <string>,
+        is_list <bool>,
+        list <&Collection<string>>,
+}
+
+#[export]
+pub struct Context {
+    pub:
+        entries <&Collection<&CtxEntry>>,
+}
+
+struct Lookup {
+    found <bool>,
+    value <string>,
+    is_list <bool>,
+    list <&Collection<string>>,
+}
+
+#[export]
+pub fun new_context() <&Context> {
+    return new Context{entries: new Collection::<&CtxEntry>{}};
+}
+
+priv fun ctx_find(ctx: &Context, key: string) <int> {
+    let n <int> = ctx.entries.len();
+    for (let i <int> = 0; i < n; i++) {
+        if (str_eq(ctx.entries.get(i).key, key)) { return i; }
+    }
+    return -1;
+}
+
+#[export]
+pub fun ctx_set(ctx: &Context, key: string, value: string) <noret> {
+    let at <int> = ctx_find(ctx, key);
+    if (at >= 0) {
+        let e <&CtxEntry> = ctx.entries.get(at);
+        e.value = value;
+        e.is_list = false;
+        return;
+    }
+    ctx.entries.push(new CtxEntry{key: key, value: value, is_list: false,
+        list: new Collection::<string>{}});
+}
+
+#[export]
+pub fun ctx_set_list(ctx: &Context, key: string, list: &Collection<string>) <noret> {
+    let at <int> = ctx_find(ctx, key);
+    if (at >= 0) {
+        let e <&CtxEntry> = ctx.entries.get(at);
+        e.value = "";
+        e.is_list = true;
+        e.list = list;
+        return;
+    }
+    ctx.entries.push(new CtxEntry{key: key, value: "", is_list: true, list: list});
+}
+
+#[export]
+pub fun ctx_remove(ctx: &Context, key: string) <noret> {
+    let at <int> = ctx_find(ctx, key);
+    if (at >= 0) {
+        ctx.entries.remove(at);
+    }
+}
+
+priv fun ctx_lookup(ctx: &Context, key: string) <Lookup> {
+    let at <int> = ctx_find(ctx, key);
+    if (at >= 0) {
+        let e <&CtxEntry> = ctx.entries.get(at);
+        return Lookup{found: true, value: e.value, is_list: e.is_list, list: e.list};
+    }
+    return Lookup{found: false, value: "", is_list: false, list: new Collection::<string>{}};
+}
+
+// Truthiness: missing -> false; list -> non-empty; string -> non-empty and
+// not "false"/"0".
+priv fun truthy(ctx: &Context, name: string) <bool> {
+    let lu <Lookup> = ctx_lookup(ctx, name);
+    if (!lu.found) { return false; }
+    if (lu.is_list) { return lu.list.len() > 0; }
+    if (str_eq(lu.value, "")) { return false; }
+    if (str_eq(lu.value, "false")) { return false; }
+    if (str_eq(lu.value, "0")) { return false; }
+    return true;
+}
+
+// Resolve an expression operand: quoted literal -> the literal;
+// a bare numeric token -> itself; otherwise a context lookup
+// (missing -> "").
+priv fun is_numeric_token(t: string) <bool> {
+    let n <int> = slen(t);
+    if (n == 0) { return false; }
+    let i <int> = 0;
+    if (starts_with(t, "-")) { i = 1; }
+    if (i == n) { return false; }
+    let cs <[char]> = to_chars(t);
+    let ok <bool> = true;
+    while (i < n) {
+        if (!is_digit(cs[i])) { ok = false; break; }
+        i++;
+    }
+    delete cs;
+    return ok;
+}
+
+priv fun operand_value(ctx: &Context, operand: string) <string> {
+    let t <string> = trim(operand);
+    if (starts_with(t, "\"")) { return unquote(t); }
+    if (is_numeric_token(t)) { return t; }
+    let lu <Lookup> = ctx_lookup(ctx, t);
+    if (lu.found && !lu.is_list) { return lu.value; }
+    return "";
+}
+
+// ---------------------------------------------------------------------------
+// Tokenizer
+// ---------------------------------------------------------------------------
+
+// Token kinds: 0 = literal text, 1 = {{ variable }}, 2 = {% tag %}.
+struct Token {
+    kind <int>,
+    text <string>,
+}
+
+priv fun tokenize(src: string) <&Collection<&Token>> {
+    let toks <&Collection<&Token>> = new Collection::<&Token>{};
+    let n <int> = slen(src);
+    let i <int> = 0;
+    let last <int> = 0;
+    while (i < n) {
+        let open <int> = scan2(src, i, '{', '{');
+        let open_tag <int> = scan2(src, i, '{', '%');
+        let open_cmt <int> = scan2(src, i, '{', '#');
+        // Earliest opener at or after i, if any.
+        let o <int> = -1;
+        let kind <int> = 0;
+        if (open >= 0) { o = open; kind = 1; }
+        if (open_tag >= 0 && (o < 0 || open_tag < o)) { o = open_tag; kind = 2; }
+        if (open_cmt >= 0 && (o < 0 || open_cmt < o)) { o = open_cmt; kind = 3; }
+        if (o < 0) { break; }
+        // Unclosed opener: the rest is literal text.
+        let close <int> = -1;
+        if (kind == 1) { close = scan2(src, o + 2, '}', '}'); }
+        if (kind == 2) { close = scan2(src, o + 2, '%', '}'); }
+        if (kind == 3) { close = scan2(src, o + 2, '#', '}'); }
+        if (close < 0) { break; }
+        if (o > last) {
+            toks.push(new Token{kind: 0, text: slice_str(src, last, o)});
+        }
+        if (kind == 1 || kind == 2) {
+            toks.push(new Token{kind: kind, text: slice_str(src, o + 2, close)});
+        }
+        // Comments are dropped, not tokenised.
+        i = close + 2;
+        last = i;
+    }
+    if (last < n) {
+        toks.push(new Token{kind: 0, text: slice_str(src, last, n)});
+    }
+    return toks;
+}
+
+// First whitespace-separated word of a tag body, "" when empty.
+priv fun first_word(tag: string) <string> {
+    let w <&Collection<string>> = split_ws(tag);
+    if (w.len() == 0) { return ""; }
+    return w.get(0);
+}
+
+// Text after the first word, trimmed.
+priv fun rest_of(tag: string) <string> {
+    let t <string> = trim(tag);
+    let sp <int> = scan_char(t, 0, ' ');
+    let tb <int> = scan_char(t, 0, '\t');
+    let cut <int> = -1;
+    if (sp >= 0) { cut = sp; }
+    if (tb >= 0 && (cut < 0 || tb < cut)) { cut = tb; }
+    if (cut < 0) { return ""; }
+    return trim(slice_str(t, cut, slen(t)));
+}
+
+// ---------------------------------------------------------------------------
+// Variable expressions + filters
+// ---------------------------------------------------------------------------
+
+struct FilterResult {
+    value <string>,
+    safe <bool>,
+}
+
+// Apply one filter segment ("name" or "name(arg)") to the current value.
+// `has_value` is false when the variable was missing; only default() can
+// rescue that case. Unknown filters leave the value unchanged.
+priv fun apply_filter(value: string, has_value: bool, seg: string) <FilterResult> {
+    let s <string> = trim(seg);
+    let paren <int> = scan_char(s, 0, '(');
+    let name <string> = s;
+    let arg <string> = "";
+    if (paren >= 0) {
+        name = trim(slice_str(s, 0, paren));
+        let close <int> = scan_char(s, paren, ')');
+        if (close > paren) {
+            arg = slice_str(s, paren + 1, close);
+        }
+    }
+    if (str_eq(name, "safe")) { return FilterResult{value: value, safe: true}; }
+    if (str_eq(name, "escape")) { return FilterResult{value: escape_html(value), safe: true}; }
+    if (str_eq(name, "default")) {
+        if (!has_value || str_eq(value, "")) {
+            return FilterResult{value: unquote(arg), safe: false};
+        }
+        return FilterResult{value: value, safe: false};
+    }
+    if (!has_value) { return FilterResult{value: "", safe: false}; }
+    if (str_eq(name, "upper")) { return FilterResult{value: upper_str(value), safe: false}; }
+    if (str_eq(name, "lower")) { return FilterResult{value: lower_str(value), safe: false}; }
+    if (str_eq(name, "title")) { return FilterResult{value: title_str(value), safe: false}; }
+    if (str_eq(name, "trim")) { return FilterResult{value: trim(value), safe: false}; }
+    if (str_eq(name, "reverse")) { return FilterResult{value: reverse_str(value), safe: false}; }
+    if (str_eq(name, "length")) { return FilterResult{value: int_to_str(slen(value)), safe: false}; }
+    if (str_eq(name, "first")) {
+        if (slen(value) == 0) { return FilterResult{value: "", safe: false}; }
+        return FilterResult{value: slice_str(value, 0, 1), safe: false};
+    }
+    if (str_eq(name, "last")) {
+        let n <int> = slen(value);
+        if (n == 0) { return FilterResult{value: "", safe: false}; }
+        return FilterResult{value: slice_str(value, n - 1, n), safe: false};
+    }
+    // Unknown filter: pass the value through unchanged.
+    return FilterResult{value: value, safe: false};
+}
+
+// Evaluate a {{ ... }} expression. List-valued variables support length /
+// first / last / join directly; every other filter sees the joined value
+// (lists join with ", " when rendered bare).
+struct ExprResult {
+    found <bool>,
+    value <string>,
+    safe <bool>,
+}
+
+priv fun eval_expr(ctx: &Context, raw: string) <ExprResult> {
+    let parts <&Collection<string>> = split_pipes(raw);
+    let head <string> = trim(parts.get(0));
+    let lu <Lookup> = ctx_lookup(ctx, head);
+    // List handling for the filters that understand lists.
+    if (lu.found && lu.is_list) {
+        if (parts.len() == 1) {
+            // Bare list renders joined with ", ".
+            let joined <string> = "";
+            for (let i <int> = 0; i < lu.list.len(); i++) {
+                if (i > 0) { joined = concat(joined, ", "); }
+                joined = concat(joined, lu.list.get(i));
+            }
+            return ExprResult{found: true, value: joined, safe: false};
+        }
+        let seg <string> = trim(parts.get(1));
+        let paren <int> = scan_char(seg, 0, '(');
+        let fname <string> = seg;
+        let farg <string> = "";
+        if (paren >= 0) {
+            fname = trim(slice_str(seg, 0, paren));
+            let close <int> = scan_char(seg, paren, ')');
+            if (close > paren) { farg = unquote(slice_str(seg, paren + 1, close)); }
+        }
+        if (str_eq(fname, "length")) {
+            return ExprResult{found: true, value: int_to_str(lu.list.len()), safe: false};
+        }
+        if (str_eq(fname, "first")) {
+            if (lu.list.len() == 0) { return ExprResult{found: true, value: "", safe: false}; }
+            return ExprResult{found: true, value: lu.list.get(0), safe: false};
+        }
+        if (str_eq(fname, "last")) {
+            if (lu.list.len() == 0) { return ExprResult{found: true, value: "", safe: false}; }
+            return ExprResult{found: true, value: lu.list.get(lu.list.len() - 1), safe: false};
+        }
+        if (str_eq(fname, "join")) {
+            let joined <string> = "";
+            for (let i <int> = 0; i < lu.list.len(); i++) {
+                if (i > 0) { joined = concat(joined, farg); }
+                joined = concat(joined, lu.list.get(i));
+            }
+            // Remaining filters (if any) apply to the joined string.
+            let cur <string> = joined;
+            let safe <bool> = false;
+            for (let k <int> = 2; k < parts.len(); k++) {
+                let fr <FilterResult> = apply_filter(cur, true, parts.get(k));
+                cur = fr.value;
+                safe = fr.safe;
+            }
+            return ExprResult{found: true, value: cur, safe: safe};
+        }
+        // Any other filter on a list: fall through to the joined string.
+        let joined <string> = "";
+        for (let i <int> = 0; i < lu.list.len(); i++) {
+            if (i > 0) { joined = concat(joined, ", "); }
+            joined = concat(joined, lu.list.get(i));
+        }
+        let cur <string> = joined;
+        let safe <bool> = false;
+        for (let k <int> = 1; k < parts.len(); k++) {
+            let fr <FilterResult> = apply_filter(cur, true, parts.get(k));
+            cur = fr.value;
+            safe = fr.safe;
+        }
+        return ExprResult{found: true, value: cur, safe: safe};
+    }
+    // Scalar path (also covers missing variables, for default()).
+    let cur <string> = "";
+    let has <bool> = false;
+    if (lu.found) { cur = lu.value; has = true; }
+    let safe <bool> = false;
+    for (let k <int> = 1; k < parts.len(); k++) {
+        let fr <FilterResult> = apply_filter(cur, has, parts.get(k));
+        cur = fr.value;
+        safe = fr.safe;
+        if (str_eq(trim(parts.get(k)), "default") || starts_with(trim(parts.get(k)), "default(")) {
+            has = true;
+        }
+    }
+    return ExprResult{found: has, value: cur, safe: safe};
+}
+
+// ---------------------------------------------------------------------------
+// {% if %} conditions
+// ---------------------------------------------------------------------------
+
+// Supported: "name", "not name", 'name == "lit"', "name != other",
+// "name == other". Anything else is falsy.
+priv fun eval_condition(ctx: &Context, cond: string) <bool> {
+    let c <string> = trim(cond);
+    if (starts_with(c, "not ")) {
+        return !truthy(ctx, trim(slice_str(c, 4, slen(c))));
+    }
+    let eq <int> = scan2(c, 0, '=', '=');
+    let ne <int> = scan2(c, 0, '!', '=');
+    if (eq >= 0) {
+        let left <string> = trim(slice_str(c, 0, eq));
+        let right <string> = trim(slice_str(c, eq + 2, slen(c)));
+        return str_eq(operand_value(ctx, left), operand_value(ctx, right));
+    }
+    if (ne >= 0) {
+        let left <string> = trim(slice_str(c, 0, ne));
+        let right <string> = trim(slice_str(c, ne + 2, slen(c)));
+        return !str_eq(operand_value(ctx, left), operand_value(ctx, right));
+    }
+    return truthy(ctx, c);
+}
+
+// ---------------------------------------------------------------------------
+// Blocks ({% block %} / {% endblock %})
+// ---------------------------------------------------------------------------
+
+struct BlockDef {
+    name <string>,
+    body <&Collection<&Token>>,
+}
+
+// Index of the tag closing the block opened at `start` (depth-aware).
+priv fun find_matching(toks: &Collection<&Token>, start: int, stop: int, openw: string, closew: string) <int> {
+    let depth <int> = 1;
+    let j <int> = start + 1;
+    while (j < stop) {
+        let t <&Token> = toks.get(j);
+        if (t.kind == 2) {
+            let w <string> = first_word(t.text);
+            if (str_eq(w, openw)) { depth++; }
+            if (str_eq(w, closew)) {
+                depth--;
+                if (depth == 0) { return j; }
+            }
+        }
+        j++;
+    }
+    return -1;
+}
+
+priv fun parse_blocks(toks: &Collection<&Token>) <&Collection<&BlockDef>> {
+    let out <&Collection<&BlockDef>> = new Collection::<&BlockDef>{};
+    let n <int> = toks.len();
+    let i <int> = 0;
+    while (i < n) {
+        let t <&Token> = toks.get(i);
+        if (t.kind == 2 && str_eq(first_word(t.text), "block")) {
+            let name <string> = rest_of(t.text);
+            let close <int> = find_matching(toks, i, n, "block", "endblock");
+            if (close > 0) {
+                let body <&Collection<&Token>> = new Collection::<&Token>{};
+                for (let k <int> = i + 1; k < close; k++) {
+                    body.push(toks.get(k));
+                }
+                out.push(new BlockDef{name: name, body: body});
+                i = close + 1;
+            } else {
+                i++;
+            }
+        } else {
+            i++;
+        }
+    }
+    return out;
+}
+
+priv fun find_block(blocks: &Collection<&BlockDef>, name: string) <int> {
+    for (let i <int> = 0; i < blocks.len(); i++) {
+        if (str_eq(blocks.get(i).name, name)) { return i; }
+    }
+    return -1;
+}
+
+// Parent defaults first, child overrides win on name clashes.
+priv fun merge_blocks(base: &Collection<&BlockDef>, over: &Collection<&BlockDef>) <&Collection<&BlockDef>> {
+    let out <&Collection<&BlockDef>> = new Collection::<&BlockDef>{};
+    for (let i <int> = 0; i < base.len(); i++) { out.push(base.get(i)); }
+    for (let i <int> = 0; i < over.len(); i++) {
+        let b <&BlockDef> = over.get(i);
+        let at <int> = find_block(out, b.name);
+        if (at >= 0) {
+            out.remove(at);
+            out.push(b);
+        } else {
+            out.push(b);
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Renderer
+// ---------------------------------------------------------------------------
+
+struct Out {
+    text <string>,
+}
+
+struct RangeResult {
+    next <int>,
+    ok <bool>,
+    err <string>,
+}
+
+struct IfBranch {
+    cond <string>,
+    is_else <bool>,
+    start <int>,
+    end <int>,
+}
+
+struct IfScan {
+    ok <bool>,
+    err <string>,
+    after <int>,
+    branches <&Collection<&IfBranch>>,
+}
+
+priv fun scan_if(toks: &Collection<&Token>, i: int, stop: int) <IfScan> {
+    let branches <&Collection<&IfBranch>> = new Collection::<&IfBranch>{};
+    let depth <int> = 1;
+    let j <int> = i + 1;
+    let cur_start <int> = i + 1;
+    let cur_cond <string> = rest_of(toks.get(i).text);
+    let cur_else <bool> = false;
+    while (j < stop) {
+        let t <&Token> = toks.get(j);
+        if (t.kind == 2) {
+            let w <string> = first_word(t.text);
+            if (str_eq(w, "if")) { depth++; }
+            if (str_eq(w, "endif")) {
+                depth--;
+                if (depth == 0) {
+                    branches.push(new IfBranch{cond: cur_cond, is_else: cur_else, start: cur_start, end: j});
+                    return IfScan{ok: true, err: "", after: j + 1, branches: branches};
+                }
+            }
+            if (depth == 1 && (str_eq(w, "elif") || str_eq(w, "else"))) {
+                branches.push(new IfBranch{cond: cur_cond, is_else: cur_else, start: cur_start, end: j});
+                cur_start = j + 1;
+                cur_else = str_eq(w, "else");
+                cur_cond = "";
+                if (!cur_else) { cur_cond = rest_of(t.text); }
+            }
+        }
+        j++;
+    }
+    return IfScan{ok: false, err: "unclosed {% if %}", after: -1, branches: branches};
+}
+
+// (for-loop rendering is inlined in render_range below: Fin resolves names
+// in declaration order, so the recursive renderer cannot call a helper that
+// itself calls the renderer.)
+
+priv fun render_range(toks: &Collection<&Token>, start: int, stop: int, ctx: &Context,
+                     blocks: &Collection<&BlockDef>, out: &Out, depth: int, ignore_blocks: bool) <RangeResult> {
+    if (depth > 64) {
+        return RangeResult{next: -1, ok: false, err: "template nesting too deep"};
+    }
+    let i <int> = start;
+    while (i < stop) {
+        let t <&Token> = toks.get(i);
+        if (t.kind == 0) {
+            out.text = concat(out.text, t.text);
+            i++;
+        } else if (t.kind == 1) {
+            let er <ExprResult> = eval_expr(ctx, trim(t.text));
+            if (er.found) {
+                let v <string> = er.value;
+                if (!er.safe) { v = escape_html(v); }
+                out.text = concat(out.text, v);
+            } else {
+                // Unknown variables stay untouched (fin-ssg compat).
+                out.text = concat(out.text, concat("{{", concat(t.text, "}}")));
+            }
+            i++;
+        } else {
+            let w <string> = first_word(t.text);
+            if (str_eq(w, "if")) {
+                let sc <IfScan> = scan_if(toks, i, stop);
+                if (!sc.ok) { return RangeResult{next: -1, ok: false, err: sc.err}; }
+                let done <bool> = false;
+                for (let b <int> = 0; b < sc.branches.len(); b++) {
+                    let br <&IfBranch> = sc.branches.get(b);
+                    if (!done) {
+                        if (br.is_else || eval_condition(ctx, br.cond)) {
+                            let rr <RangeResult> = render_range(toks, br.start, br.end, ctx, blocks, out, depth + 1, ignore_blocks);
+                            if (!rr.ok) { return rr; }
+                            done = true;
+                        }
+                    }
+                }
+                i = sc.after;
+            } else if (str_eq(w, "for")) {
+                let words <&Collection<string>> = split_ws(t.text);
+                if (words.len() == 4 && str_eq(words.get(2), "in")) {
+                    let var_name <string> = words.get(1);
+                    let list_name <string> = words.get(3);
+                    let close <int> = find_matching(toks, i, stop, "for", "endfor");
+                    if (close < 0) {
+                        return RangeResult{next: -1, ok: false, err: "unclosed {% for %}"};
+                    }
+                    let lu <Lookup> = ctx_lookup(ctx, list_name);
+                    if (lu.found && lu.is_list) {
+                        // Save whatever the loop variables shadowed.
+                        let old_var <Lookup> = ctx_lookup(ctx, var_name);
+                        let old_idx <Lookup> = ctx_lookup(ctx, "loop.index");
+                        let old_idx0 <Lookup> = ctx_lookup(ctx, "loop.index0");
+                        let old_first <Lookup> = ctx_lookup(ctx, "loop.first");
+                        let old_last <Lookup> = ctx_lookup(ctx, "loop.last");
+                        let old_len <Lookup> = ctx_lookup(ctx, "loop.length");
+                        let total <int> = lu.list.len();
+                        let bad <bool> = false;
+                        let bad_err <string> = "";
+                        for (let k <int> = 0; k < total; k++) {
+                            ctx_set(ctx, var_name, lu.list.get(k));
+                            ctx_set(ctx, "loop.index", int_to_str(k + 1));
+                            ctx_set(ctx, "loop.index0", int_to_str(k));
+                            if (k == 0) { ctx_set(ctx, "loop.first", "true"); } else { ctx_set(ctx, "loop.first", "false"); }
+                            if (k == total - 1) { ctx_set(ctx, "loop.last", "true"); } else { ctx_set(ctx, "loop.last", "false"); }
+                            ctx_set(ctx, "loop.length", int_to_str(total));
+                            let rr <RangeResult> = render_range(toks, i + 1, close, ctx, blocks, out, depth + 1, ignore_blocks);
+                            if (!rr.ok) { bad = true; bad_err = rr.err; break; }
+                        }
+                        // Restore the shadowed variables.
+                        if (old_var.found) {
+                            if (old_var.is_list) { ctx_set_list(ctx, var_name, old_var.list); } else { ctx_set(ctx, var_name, old_var.value); }
+                        } else { ctx_remove(ctx, var_name); }
+                        if (old_idx.found) { ctx_set(ctx, "loop.index", old_idx.value); } else { ctx_remove(ctx, "loop.index"); }
+                        if (old_idx0.found) { ctx_set(ctx, "loop.index0", old_idx0.value); } else { ctx_remove(ctx, "loop.index0"); }
+                        if (old_first.found) { ctx_set(ctx, "loop.first", old_first.value); } else { ctx_remove(ctx, "loop.first"); }
+                        if (old_last.found) { ctx_set(ctx, "loop.last", old_last.value); } else { ctx_remove(ctx, "loop.last"); }
+                        if (old_len.found) { ctx_set(ctx, "loop.length", old_len.value); } else { ctx_remove(ctx, "loop.length"); }
+                        if (bad) { return RangeResult{next: -1, ok: false, err: bad_err}; }
+                    }
+                    i = close + 1;
+                } else {
+                    out.text = concat(out.text, concat("{%", concat(t.text, "%}")));
+                    i++;
+                }
+            } else if (str_eq(w, "block")) {
+                let name <string> = rest_of(t.text);
+                let close <int> = find_matching(toks, i, stop, "block", "endblock");
+                if (close < 0) {
+                    out.text = concat(out.text, concat("{%", concat(t.text, "%}")));
+                    i++;
+                } else if (ignore_blocks) {
+                    let rr <RangeResult> = render_range(toks, i + 1, close, ctx, blocks, out, depth + 1, true);
+                    if (!rr.ok) { return rr; }
+                    i = close + 1;
+                } else {
+                    let at <int> = find_block(blocks, name);
+                    if (at >= 0) {
+                        let body <&Collection<&Token>> = blocks.get(at).body;
+                        let rr <RangeResult> = render_range(body, 0, body.len(), ctx, blocks, out, depth + 1, true);
+                        if (!rr.ok) { return rr; }
+                    } else {
+                        let rr <RangeResult> = render_range(toks, i + 1, close, ctx, blocks, out, depth + 1, false);
+                        if (!rr.ok) { return rr; }
+                    }
+                    i = close + 1;
+                }
+            } else {
+                // Stray endif/endfor/endblock/else/elif, extends (handled
+                // before rendering), include, or unknown tags: literal text.
+                out.text = concat(out.text, concat("{%", concat(t.text, "%}")));
+                i++;
+            }
+        }
+    }
+    return RangeResult{next: i, ok: true, err: ""};
+}
+
+// ---------------------------------------------------------------------------
+// {% extends %} resolution
+// ---------------------------------------------------------------------------
+
+priv fun dir_of(path: string) <string> {
+    let last <int> = -1;
+    let cs <[char]> = to_chars(path);
+    let n <int> = cs.length - 1;
+    for (let k <int> = 0; k < n; k++) {
+        if (cs[k] == '/') { last = k; }
+    }
+    delete cs;
+    if (last < 0) { return ""; }
+    return slice_str(path, 0, last);
+}
+
+priv fun is_ws_only(s: string) <bool> {
+    return str_eq(trim(s), "");
+}
+
+// The extends target when the first meaningful token is {% extends "x" %},
+// else "".
+priv fun extends_target(toks: &Collection<&Token>) <string> {
+    for (let i <int> = 0; i < toks.len(); i++) {
+        let t <&Token> = toks.get(i);
+        if (t.kind == 0) {
+            if (!is_ws_only(t.text)) { return ""; }
+        } else if (t.kind == 1) {
+            return "";
+        } else {
+            if (str_eq(first_word(t.text), "extends")) {
+                return unquote(rest_of(t.text));
+            }
+            return "";
+        }
+    }
+    return "";
+}
+
+#[export]
+pub struct RenderResult {
+    pub:
+        ok <bool>,
+        output <string>,
+        error <string>,
+}
+
+priv fun render_with(src: string, base_dir: string, ctx: &Context,
+                    overrides: &Collection<&BlockDef>, depth: int) <RenderResult> {
+    if (depth > 8) {
+        return RenderResult{ok: false, output: "", error: "template inheritance too deep"};
+    }
+    let toks <&Collection<&Token>> = tokenize(src);
+    let parent <string> = extends_target(toks);
+    if (!str_eq(parent, "")) {
+        let ppath <string> = parent;
+        if (!str_eq(base_dir, "")) { ppath = concat(concat(base_dir, "/"), parent); }
+        let praw? <string> = read_to_string(ppath);
+        if (praw == null) {
+            return RenderResult{ok: false, output: "", error: concat("extends: cannot read '", concat(ppath, "'"))};
+        }
+        let psrc <string> = praw?;
+        let merged <&Collection<&BlockDef>> = merge_blocks(parse_blocks(tokenize(psrc)), parse_blocks(toks));
+        let r <RenderResult> = render_with(psrc, dir_of(ppath), ctx, merged, depth + 1);
+        return r;
+    }
+    let out <&Out> = new Out{text: ""};
+    let rr <RangeResult> = render_range(toks, 0, toks.len(), ctx, overrides, out, 0, false);
+    if (!rr.ok) {
+        return RenderResult{ok: false, output: "", error: rr.err};
+    }
+    return RenderResult{ok: true, output: out.text, error: ""};
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+#[export]
+pub struct Template {
+    pub:
+        source <string>,
+        base_dir <string>,
+}
+
+#[export]
+pub struct TemplateResult {
+    pub:
+        ok <bool>,
+        template <Template>,
+        error <string>,
+}
+
+#[export]
+pub fun template_from_string(src: string) <Template> {
+    return Template{source: src, base_dir: ""};
+}
+
+// Load a template from a file. base_dir becomes the directory of the file,
+// so {% extends %} resolves relative to it.
+#[export]
+pub fun template_from_file(path: string) <TemplateResult> {
+    let raw? <string> = read_to_string(path);
+    if (raw == null) {
+        return TemplateResult{ok: false, template: Template{source: "", base_dir: ""},
+            error: concat("cannot read template '", concat(path, "'"))};
+    }
+    let rsrc <string> = raw?;
+    return TemplateResult{ok: true, template: Template{source: rsrc, base_dir: dir_of(path)}, error: ""};
+}
+
+#[export]
+pub fun template_render(t: &Template, ctx: &Context) <RenderResult> {
+    return render_with(t.source, t.base_dir, ctx, new Collection::<&BlockDef>{}, 0);
+}
+
+// One-shot: render a source string with no file context.
+#[export]
+pub fun render_string(src: string, ctx: &Context) <RenderResult> {
+    return render_with(src, "", ctx, new Collection::<&BlockDef>{}, 0);
+}
+
+// One-shot: load a file and render it.
+#[export]
+pub fun template_render_file(path: string, ctx: &Context) <RenderResult> {
+    let tr <TemplateResult> = template_from_file(path);
+    if (!tr.ok) {
+        return RenderResult{ok: false, output: "", error: tr.error};
+    }
+    return template_render(&tr.template, ctx);
+}
+
+// Drop-in for the minimal {{key}} engine fin-ssg vendored
+// (apps/fin-ssg/src/vendor/template.fin). Same four slots; the content slot
+// is rendered unescaped (it carries pre-rendered HTML), while site_title,
+// title and date are auto-escaped (fin-template's default — callers that
+// pre-escaped those should stop doing so).
+#[export]
+pub fun tpl_render(tpl: string, site_title: string, title: string, date: string, content: string) <string> {
+    let src <string> = replace(tpl, "{{content}}", "{{content|safe}}");
+    src = replace(src, "{{ content }}", "{{ content|safe }}");
+    let ctx <&Context> = new_context();
+    ctx_set(ctx, "site_title", site_title);
+    ctx_set(ctx, "title", title);
+    ctx_set(ctx, "date", date);
+    ctx_set(ctx, "content", content);
+    let r <RenderResult> = render_string(src, ctx);
+    if (!r.ok) { return ""; }
+    return r.output;
+}
+
 }

@@ -11,6 +11,7 @@ const MAX_ARGS <int> = 256;
 const MAX_ARG_BYTES <int> = 65536;
 const MAX_FILES <int> = 4096;
 const MAX_INPUT <int> = 4194304;
+const MAX_OUTPUT <int> = 33554432;
 
 struct Argv { args <[string]>, count <int>, ok <bool> }
 // The arguments the process was started with, bounded. The compiler's own
@@ -216,6 +217,17 @@ fun safe_names(files: &FileList) <bool> {
     return ok;
 }
 
+// fin-template has no output bound; the old vendored engine capped rendered
+// output at 32 MiB via TextBuffer. Re-impose the bound here so a layout
+// repeating {{content}} cannot expand a page past it (security.py's
+// expansion test: 64 x 600,000 chars must fail the page, leaving any old
+// page in place, not publish 38 MB). Returns null on overflow.
+fun? render_page(layout: string, site_title: string, title: string, date: string, content: string) <string> {
+    let page <string> = tpl_render(layout, site_title, title, date, content);
+    if (len(page) > MAX_OUTPUT) { free_str(page); return null; }
+    return page;
+}
+
 fun build_site(content: string, layout_dir: string, out: string, title: string, abi: OpenFlags) <int> {
     let input <int> = platform_open_directory(content, false, abi);
     if (input < 0) { printf("error: content must be a readable, non-symlink directory: %s\n", content); return 1; }
@@ -277,7 +289,7 @@ fun build_site(content: string, layout_dir: string, out: string, title: string, 
         free_str(raw?);
         let fragment? <string> = md_to_html(meta.body);
         let page? <string> = null;
-        if (fragment != null) { page = tpl_render(layout, title, meta.title, meta.date, fragment?); free_str(fragment?); }
+        if (fragment != null) { page = render_page(layout, title, meta.title, meta.date, fragment?); free_str(fragment?); }
         let ok <bool> = false;
         if (page != null) { ok = atomic_write(output, dest, page?, abi); free_str(page?); }
         if (!ok) { printf("warn: rendering limit or publication failure: %s\n", name); failed++; }
@@ -294,7 +306,7 @@ fun build_site(content: string, layout_dir: string, out: string, title: string, 
     let body? <string> = text_finish(&index);
     let index_ok <bool> = false;
     if (body != null) {
-        let page? <string> = tpl_render(layout, title, title, "", body?);
+        let page? <string> = render_page(layout, title, title, "", body?);
         free_str(body?);
         if (page != null) { index_ok = atomic_write(output, "index.html", page?, abi); free_str(page?); }
     }
