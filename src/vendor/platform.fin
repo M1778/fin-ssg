@@ -187,10 +187,10 @@ pub fun directory_path(handle: DirHandle) <string> {
 // are the target's, so they come from the ABI record rather than from a
 // constant here.
 #[llvm_name="openat"]
-@define platform_openat(dir: int, path: string, flags: int, mode: int) <int>;
+@define platform_openat(dir: int, path: string, flags: int, ...) <int>;
 
 #[llvm_name="open"]
-@define platform_open(path: string, flags: int, mode: int) <int>;
+@define platform_open(path: string, flags: int, ...) <int>;
 
 #[llvm_name="close"]
 @define platform_close(fd: int) <int>;
