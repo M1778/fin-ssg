@@ -12,11 +12,12 @@ language" demo — think a tiny Hugo.
 > The generator remains entirely Fin; Python 3 is used only for black-box tests.
 >
 > The filesystem layer selects native Linux, macOS and Windows calls. The
-> current repair passes local Linux x86_64 and native Windows x86_64 O0/O2
-> smoke, security and filesystem tests. Darwin branches pass frontend/codegen
-> checks; native execution of repaired macOS and Linux ARM64 branches still
-> needs a new matrix run. Older runs do not validate the current uncommitted
-> changes.
+> The pushed portability revision passed O0/O2 smoke/security/filesystem tests
+> on all six native hosts—Linux, macOS and Windows, each on x86_64 and ARM64—in
+> [native matrix 40034937084](https://github.com/M1778/fin-sdk/actions/runs/40034937084).
+> The compiler is externally verified candidate
+> `5360b051b8e82a4f10052c3dbb77bc66cc727cd7` from CI run `40028977601`, not a
+> released version. Platform-specific test skips and durability limits remain below.
 
 ## What it does
 
