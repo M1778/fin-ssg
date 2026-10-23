@@ -30,7 +30,7 @@ layout/page.html   ─┘               public/second.html
 - Reads every `*.md` in the content directory (flat, no recursion).
 - Optional `---` front matter at the top of a file sets `title:` and `date:`.
   Without it, the title falls back to the file slug.
-- Renders Markdown with a vendored subset (see below), wraps the fragment in
+- Renders Markdown with fin-markdown (see below), wraps the fragment in
   `layout/page.html` (`{{site_title}}`, `{{title}}`, `{{date}}`, `{{content}}`
   slots), and writes `<slug>.html`.
 - Generates `index.html`: the site title plus one link per page.
@@ -75,24 +75,32 @@ $ ls public
 hello.html  index.html  second.html
 ```
 
-## Markdown subset (v0.1)
+## Markdown subset (v0.1, fin-markdown)
 
-Block: `#`/`##`/`###` headings, paragraphs, fenced code blocks
-(\`\`\`), `-`/`*` unordered lists, `1.` ordered lists, `>` blockquotes,
-`---` horizontal rules.
-Inline: \`code\`, `**bold**`, `*italic*`, `[text](url)`, `![alt](url)`.
+Block: `#`–`######` headings (optional closing hashes), setext headings
+(`===`/`---` under a paragraph line), paragraphs, fenced code blocks
+(\`\`\`, info string emitted as `class="language-x"`), `-`/`*` unordered
+lists, `1.` ordered lists, `>` blockquotes, `---`/`***`/`___` horizontal
+rules, hard breaks (two trailing spaces become `<br>`).
+Inline: \`code\`, `**bold**`, `*italic*`, `***bold italic***`,
+`~~strikethrough~~`, `[text](url)`, `![alt](url)`, reference links
+(`[text][id]`, `[text][]`, `[text]` with `[id]: url` definitions anywhere
+in the document), autolinks (`<https://…>`).
 All text and quoted attributes are HTML-escaped. Links allow `http`, `https`,
 `mailto`, and relative URLs; images allow `http`, `https`, and relative URLs.
 Unsafe schemes, control characters, scheme entity obfuscation, protocol-relative
 URLs, and encoded structural/control bytes degrade to literal Markdown.
 Percent-encoded spaces in relative paths remain supported. Filenames are
 URL-encoded in the index, including quotes, spaces, Unicode and newlines.
+Documents of any line count render in full (no line cap); rendered output
+is bounded at 32 MiB per page.
 
 Not supported yet (degrade to literal text, never abort): nested lists,
-tables, reference links, setext headings, headings deeper than `###`,
-multi-line quote merging, recursive content directories. Inline nesting beyond
-16 levels becomes literal text. Layout substitutions are single-pass: metadata
-containing `{{content}}` stays literal and cannot introduce another substitution.
+tables, indented code blocks, headings deeper than `######`,
+multi-line quote merging, recursive content directories. Emphasis markers
+inside an emitted link/image tag (e.g. `**` in a URL) are never rewritten.
+Layout substitutions are single-pass: metadata containing `{{content}}`
+stays literal and cannot introduce another substitution.
 
 ## Filesystem safety and limits
 
@@ -135,15 +143,27 @@ containing `{{content}}` stays literal and cannot introduce another substitution
   Compiler/stdlib fixes are outside this repository; this is not a claim of
   fully leak-free O0 execution.
 
-## Vendored code
+## Adopted libraries (vendored copies under src/vendor/)
 
-`fin-markdown` does not exist yet and `M1778/template` is a project
-scaffold, not a templating engine — so both are hand-rolled inside this
-repo and clearly marked:
+Until the finn registry resolves bare package names, the libraries live
+as vendored copies in `src/vendor/` (imported by module name, so a
+future `[packages]` switch needs no code change):
 
-- `src/vendor/markdown.fin` — native Fin Markdown parsing, URL checks, escaping,
-  and bounded amortized text buffers.
-- `src/vendor/template.fin` — native Fin single-pass four-slot template engine.
+- `src/vendor/markdown.fin` — fin-markdown v0.1.0, plus fin-ssg
+  hardening ported from the previous vendored renderer: the URL scheme
+  allowlist, quote-safe attribute emission, tag-aware emphasis passes,
+  the `TextBuffer`/`filename_url` helpers `main.fin` uses, and
+  cursor-based line iteration (no document line cap). Upstreaming
+  candidates for fin-markdown: the allowlist, tag-aware emphasis, and
+  the cursor (upstream still caps at 8192 lines).
+- `src/vendor/template.fin` — fin-template v0.1.0, used through its
+  `tpl_render` compatibility entry point (same four slots as the old
+  engine, auto-escaped metadata, `{{content|safe}}` body). Layouts may
+  also use the full engine syntax (`{{ x | filter }}`, `{% if %}`,
+  `{% for %}`); the 32 MiB rendered-output bound is enforced by
+  `main.fin`'s `render_page`, since the library itself has no cap.
+  `src/vendor/platform.fin` remains hand-rolled (native open-flag
+  selection for this tool, not a reusable library).
 
 Both are imported by name (`import { md_to_html } from markdown::fin`) and
 compile through the native backend. Returned renderer strings are explicitly

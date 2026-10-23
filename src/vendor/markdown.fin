@@ -1,7 +1,70 @@
-// VENDORED — native Fin Markdown subset and bounded, amortized text buffers.
-// Generated HTML is never reparsed as Markdown. All returned strings are owned.
-import { len, to_chars, from_chars, free_str } from strings::std;
+// ADOPTED 2026-10-23: fin-markdown v0.1.0 (M1778/fin-markdown, builder-3 copy).
+// Replaces the vendored Markdown subset. Deltas vs upstream fin-markdown,
+// all required by fin-ssg's security suite (tests/security.py):
+//   * URL scheme allowlist (http/https, +mailto for links only) on
+//     inline, autolink and reference-link URLs; unsafe URLs degrade to
+//     literal text instead of becoming links (old vendored safe_url).
+//   * Attribute emission escapes quotes (inline URLs/alt text are already
+//     &<>-escaped by the pipeline, so only quotes are added there;
+//     raw ref-definition URLs get full &<>"' escaping).
+//   * Emphasis passes (*, **, ***, ___, ~~) skip markers inside <...>
+//     tags, so markup characters inside an emitted href/src survive.
+//   * TextBuffer helpers + md_escape_into + filename_url ported from the
+//     old vendored file (main.fin imports them from markdown::fin).
+//   * md_to_html stays non-nullable; the 32 MiB published-output bound
+//     lives in main.fin's render_page (as after the fin-template swap).
+// Upstreaming note: the allowlist + tag-aware emphasis should move into
+// fin-markdown itself so the next upgrade is a clean swap.
+// fin-markdown — Markdown → HTML for Fin (v0.1.0).
+//
+// Drop-in replacement for the Markdown subset vendored in fin-ssg's
+// src/vendor/markdown.fin (marked there for replacement). Same public API
+// and same import spelling:
+//   import { md_to_html, md_inline, md_escape_html } from markdown::fin;
+//
+// Block subset:
+//   ATX headings (# … ######, optional closing #'s), setext headings
+//   (=== / --- under a paragraph line), paragraphs, fenced code blocks
+//   (``` with an optional info string -> class="language-x"), unordered
+//   lists (-, *), ordered lists (1.), blockquotes (>), horizontal rules
+//   (---, ***, ___), hard breaks (two trailing spaces -> <br>).
+// Inline subset: `code`, **bold**, *italic*, ***bold italic***,
+// ~~strikethrough~~, [links](url), ![images](url), reference links
+// ([t][id], [t][], [t] with [id]: url definitions anywhere in the
+// document), autolinks (<https://example.com>).
+//
+// Deliberately NOT supported yet: nested lists, tables, indented code
+// blocks, reference images, footnote syntax, headings inside blockquotes
+// beyond inline markup, underscore emphasis (intraword _ is ambiguous),
+// link titles, link-definition lines inside lists/quotes (top-level only).
+// Reference-definition ids match after trim + lowercase (internal
+// whitespace runs are not collapsed). A literal "@@MDBREAK@@" in source
+// text is safe (hard breaks are applied by newline counting, not by a
+// sentinel). One edge case: a code span that spans two paragraph lines
+// shifts hard-break positions after it — hard breaks after such a span
+// may land on the wrong newline.
+//
+// All text is HTML-escaped; code spans and fences are escaped but never
+// inline-processed. Malformed markup degrades to literal text — nothing
+// here aborts (no `blame`): the input is user-authored content.
+//
+// Fin 0.4.0 backend-limit compliance (measured by Builders #1/#2):
+//   * NO `const` declarations at all (not even private ones — they do
+//     not lower through an import); literals only.
+//   * No enum-typed struct fields (MDState holds strings/bools only).
+//   * No Collection<StructType>; reference definitions live in fixed
+//     [string] arrays (cap 512 definitions, 8192 lines per document).
+//   * No null string returns/arguments ("" is the not-found sentinel).
+//   * Only by-name imported calls (strings::std); no @define externs
+//     at all in this module, so nothing depends on extern lowering.
+
+import { len, find, substr, concat, clone, equals, starts_with, ends_with, trim, trim_end, to_lower, index_of_char, is_numeric, free_str, replace, to_chars, from_chars } from strings::std;
+
 namespace fin {
+
+// --- TextBuffer (ported verbatim from the old vendored renderer) ---
+// Bounded, amortized buffers; main.fin builds the index page with them.
+// The 32 MiB cap is the same bound render_page enforces on final output.
 
 pub struct TextBuffer { bytes <[char]>, used <int>, ok <bool> }
 
@@ -45,7 +108,7 @@ pub fun? text_finish(b: &TextBuffer) <string> {
     return result;
 }
 
-fun escape_char(b: &TextBuffer, c: char) <noret> {
+fun ssg_escape_char(b: &TextBuffer, c: char) <noret> {
     if (c == '&') { text_append(b, "&amp;"); }
     else if (c == '<') { text_append(b, "&lt;"); }
     else if (c == '>') { text_append(b, "&gt;"); }
@@ -54,83 +117,10 @@ fun escape_char(b: &TextBuffer, c: char) <noret> {
     else { text_char(b, c); }
 }
 
-fun escape_range(b: &TextBuffer, chars: [char], start: int, end: int) <noret> {
-    for (let i <int> = start; i < end; i++) { escape_char(b, chars[i]); }
-}
-
 pub fun md_escape_into(b: &TextBuffer, s: string) <noret> {
     let chars <[char]> = to_chars(s);
-    escape_range(b, chars, 0, chars.length - 1);
+    for (let i <int> = 0; i < chars.length - 1; i++) { ssg_escape_char(b, chars[i]); }
     delete chars;
-}
-
-fun lower(c: char) <char> {
-    if (c >= 'A' && c <= 'Z') { return cast<char>(cast<int>(c) + 32); }
-    return c;
-}
-
-fun matches(chars: [char], pos: int, end: int, token: string) <bool> {
-    let t <[char]> = to_chars(token);
-    let n <int> = t.length - 1;
-    let same <bool> = pos + n <= end;
-    for (let i <int> = 0; same && i < n; i++) {
-        if (chars[pos + i] != t[i]) { same = false; }
-    }
-    delete t;
-    return same;
-}
-
-fun scheme_is(chars: [char], start: int, end: int, token: string) <bool> {
-    let t <[char]> = to_chars(token);
-    let same <bool> = end - start == t.length - 1;
-    for (let i <int> = 0; same && i < t.length - 1; i++) {
-        if (lower(chars[start + i]) != t[i]) { same = false; }
-    }
-    delete t;
-    return same;
-}
-
-fun hex_value(c: char) <int> {
-    if (c >= '0' && c <= '9') { return cast<int>(c) - cast<int>('0'); }
-    let lc <char> = lower(c);
-    if (lc >= 'a' && lc <= 'f') { return cast<int>(lc) - cast<int>('a') + 10; }
-    return -1;
-}
-
-// Scheme allowlist, not a blacklist. Entity-like scheme spellings and encoded
-// controls/structural separators are rejected, including nested percent escapes.
-fun safe_url(chars: [char], start: int, end: int, image: bool) <bool> {
-    if (start == end) { return false; }
-    if (end - start >= 2 && chars[start] == '/' && chars[start + 1] == '/') { return false; }
-    let scheme_end <int> = -1;
-    let prefix <bool> = true;
-    for (let i <int> = start; i < end; i++) {
-        let c <char> = chars[i];
-        let byte <int> = cast<int>(c) & 255;
-        if (byte <= 32 || byte == 127 || c == '\\') { return false; }
-        if (c == '&' && (prefix || matches(chars, i, end, "&#") || matches(chars, i, end, "&colon;") || matches(chars, i, end, "&Tab;") || matches(chars, i, end, "&NewLine;"))) { return false; }
-        if (c == '%') {
-            if (i + 2 >= end) { return false; }
-            let hi <int> = hex_value(chars[i + 1]);
-            let lo <int> = hex_value(chars[i + 2]);
-            if (hi < 0 || lo < 0) { return false; }
-            let decoded <int> = hi * 16 + lo;
-            if (decoded < 32 || decoded == 127 || decoded == 37 || decoded == 58 || decoded == 92 || decoded == 38) { return false; }
-            // A percent escape cannot be part of an explicit scheme.
-            if (prefix && scheme_end < 0) {
-                let j <int> = i + 3;
-                while (j < end && chars[j] != '/' && chars[j] != '?' && chars[j] != '#') {
-                    if (chars[j] == ':') { return false; }
-                    j++;
-                }
-                prefix = false;
-            }
-            i = i + 2;
-        } else if (prefix && c == ':') { scheme_end = i; prefix = false; }
-        else if (c == '/' || c == '?' || c == '#') { prefix = false; }
-    }
-    if (scheme_end < 0) { return true; }
-    return scheme_is(chars, start, scheme_end, "http") || scheme_is(chars, start, scheme_end, "https") || (!image && scheme_is(chars, start, scheme_end, "mailto"));
 }
 
 // Percent-encode UTF-8 filename bytes as a single relative URL path segment.
@@ -149,168 +139,867 @@ pub fun filename_url(b: &TextBuffer, name: string) <noret> {
     delete digits;
 }
 
-fun find_char(chars: [char], start: int, end: int, c: char) <int> {
-    for (let i <int> = start; i < end; i++) { if (chars[i] == c) { return i; } }
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+// Absolute index of `needle` in `s` at or after `start`, or -1.
+fun md_find_from_i(s: string, needle: string, start: int) <int> {
+    if (start < 0) { start = 0; }
+    let total <int> = len(s);
+    if (start >= total) { return -1; }
+    let rel <int> = find(substr(s, start, total - start), needle);
+    if (rel < 0) { return -1; }
+    return start + rel;
+}
+
+// s with the span [from, to_excl) replaced by rep.
+fun md_replace_span(s: string, from_idx: int, to_excl: int, rep: string) <string> {
+    return concat(concat(substr(s, 0, from_idx), rep), substr(s, to_excl, len(s) - to_excl));
+}
+
+// index_of_char at or after `start`, or -1.
+fun md_index_from(s: string, c: char, start: int) <int> {
+    if (start < 0) { start = 0; }
+    let total <int> = len(s);
+    if (start >= total) { return -1; }
+    let rel <int> = index_of_char(substr(s, start, total - start), c);
+    if (rel < 0) { return -1; }
+    return start + rel;
+}
+
+// Find needle at or after start, skipping occurrences inside <...> tags.
+// Emphasis passes run AFTER link/image expansion, so the string already
+// contains <a href="..."> / <img ...> tags; a *, _ or ~ inside an
+// attribute value (e.g. ** in a URL) must never be treated as markup.
+// Backward scan: the nearest < or > before the occurrence decides.
+// (Known shared limitation with the rest of this file: marker-dense
+// pathological input is quadratic — same class as md_replace_span's
+// whole-string copies; realistic documents are unaffected.)
+fun md_find_tag_aware(s: string, needle: string, start: int) <int> {
+    let pos <int> = start;
+    while (true) {
+        let a <int> = md_find_from_i(s, needle, pos);
+        if (a < 0) { return -1; }
+        let inside <bool> = false;
+        let j <int> = a - 1;
+        while (j >= 0) {
+            let c <string> = substr(s, j, 1);
+            if (equals(c, ">")) { break; }
+            if (equals(c, "<")) { inside = true; break; }
+            j--;
+        }
+        if (!inside) { return a; }
+        pos = a + 1;
+    }
+    return -1;  // unreachable: the loop only exits via return, but the
+    // frontend does not treat while (true) as diverging.
+}
+
+// ---------------------------------------------------------------------------
+// HTML escaping
+// ---------------------------------------------------------------------------
+
+// Escape &, <, > (ampersand first so we never double-escape).
+pub fun md_escape_html(s: string) <string> {
+    let e <string> = replace(s, "&", "&amp;");
+    let e2 <string> = replace(e, "<", "&lt;");
+    return replace(e2, ">", "&gt;");
+}
+
+pub fun md_version() <string> {
+    // clone: callers may free_str the result (a literal must never be freed).
+    return clone("0.1.0");
+}
+
+// ---------------------------------------------------------------------------
+// URL safety (fin-ssg hardening — ported from the old vendored renderer)
+// ---------------------------------------------------------------------------
+// Scheme allowlist, not a blacklist. Entity-like scheme spellings and
+// encoded controls/structural separators are rejected, including nested
+// percent escapes. Inline URLs arrive here HTML-escaped (& < > already
+// entities), so they are decoded to a check form first; ref-definition
+// URLs arrive raw and are checked directly.
+
+fun ssg_lower(c: char) <char> {
+    if (c >= 'A' && c <= 'Z') { return cast<char>(cast<int>(c) + 32); }
+    return c;
+}
+
+fun ssg_hex_value(c: char) <int> {
+    if (c >= '0' && c <= '9') { return cast<int>(c) - cast<int>('0'); }
+    let lc <char> = ssg_lower(c);
+    if (lc >= 'a' && lc <= 'f') { return cast<int>(lc) - cast<int>('a') + 10; }
     return -1;
 }
 
-fun find_pair(chars: [char], start: int, end: int, a: char, b: char) <int> {
-    for (let i <int> = start; i + 1 < end; i++) { if (chars[i] == a && chars[i + 1] == b) { return i; } }
-    return -1;
+fun ssg_matches(chars: [char], pos: int, end: int, token: string) <bool> {
+    let t <[char]> = to_chars(token);
+    let n <int> = t.length - 1;
+    let same <bool> = pos + n <= end;
+    for (let i <int> = 0; same && i < n; i++) {
+        if (chars[pos + i] != t[i]) { same = false; }
+    }
+    delete t;
+    return same;
 }
 
-// Consumed spans are not rescanned. Failed delimiter searches are remembered;
-// nesting is bounded, so malformed input cannot trigger quadratic suffix scans.
-fun inline_range(b: &TextBuffer, chars: [char], start: int, end: int, depth: int) <noret> {
-    if (depth >= 16) { escape_range(b, chars, start, end); return; }
-    let code_possible <bool> = true;
-    let links_possible <bool> = true;
-    let bold_possible <bool> = true;
-    let italic_possible <bool> = true;
+fun ssg_scheme_is(chars: [char], start: int, end: int, token: string) <bool> {
+    let t <[char]> = to_chars(token);
+    let same <bool> = end - start == t.length - 1;
+    for (let i <int> = 0; same && i < t.length - 1; i++) {
+        if (ssg_lower(chars[start + i]) != t[i]) { same = false; }
+    }
+    delete t;
+    return same;
+}
+
+fun ssg_safe_url_chars(chars: [char], start: int, end: int, image: bool) <bool> {
+    if (start == end) { return false; }
+    if (end - start >= 2 && chars[start] == '/' && chars[start + 1] == '/') { return false; }
+    let scheme_end <int> = -1;
+    let prefix <bool> = true;
     let i <int> = start;
-    while (i < end && b.ok) {
+    while (i < end) {
         let c <char> = chars[i];
-        if (c == '`' && code_possible) {
-            let close <int> = find_char(chars, i + 1, end, '`');
-            if (close >= 0) {
-                text_append(b, "<code>"); escape_range(b, chars, i + 1, close); text_append(b, "</code>");
-                i = close + 1; continue;
-            }
-            code_possible = false;
-        }
-        let image <bool> = c == '!' && i + 1 < end && chars[i + 1] == '[';
-        if ((image || c == '[') && links_possible) {
-            let label <int> = i + 1;
-            if (image) { label++; }
-            let middle <int> = find_pair(chars, label, end, ']', '(');
-            if (middle < 0) { links_possible = false; }
-            else {
-                let close <int> = find_char(chars, middle + 2, end, ')');
-                if (close < 0) { links_possible = false; }
-                else {
-                    if (safe_url(chars, middle + 2, close, image)) {
-                        if (image) { text_append(b, "<img src=\""); }
-                        else { text_append(b, "<a href=\""); }
-                        escape_range(b, chars, middle + 2, close);
-                        if (image) {
-                            text_append(b, "\" alt=\""); escape_range(b, chars, label, middle); text_append(b, "\">");
-                        } else {
-                            text_append(b, "\">"); escape_range(b, chars, label, middle); text_append(b, "</a>");
-                        }
-                    } else { escape_range(b, chars, i, close + 1); }
-                    i = close + 1; continue;
+        let byte <int> = cast<int>(c) & 255;
+        if (byte <= 32 || byte == 127 || c == '\\') { return false; }
+        if (c == '&' && (prefix || ssg_matches(chars, i, end, "&#") || ssg_matches(chars, i, end, "&colon;") || ssg_matches(chars, i, end, "&Tab;") || ssg_matches(chars, i, end, "&NewLine;"))) { return false; }
+        if (c == '%') {
+            if (i + 2 >= end) { return false; }
+            let hi <int> = ssg_hex_value(chars[i + 1]);
+            let lo <int> = ssg_hex_value(chars[i + 2]);
+            if (hi < 0 || lo < 0) { return false; }
+            let decoded <int> = hi * 16 + lo;
+            if (decoded < 32 || decoded == 127 || decoded == 37 || decoded == 58 || decoded == 92 || decoded == 38) { return false; }
+            if (prefix && scheme_end < 0) {
+                let j <int> = i + 3;
+                while (j < end && chars[j] != '/' && chars[j] != '?' && chars[j] != '#') {
+                    if (chars[j] == ':') { return false; }
+                    j++;
                 }
+                prefix = false;
             }
-        }
-        if (c == '*') {
-            let bold <bool> = i + 1 < end && chars[i + 1] == '*';
-            let close <int> = -1;
-            let width <int> = 1;
-            if (bold && bold_possible) {
-                width = 2;
-                close = find_pair(chars, i + 2, end, '*', '*');
-                if (close < 0) { bold_possible = false; }
-            } else if (!bold && italic_possible) {
-                close = find_char(chars, i + 1, end, '*');
-                if (close < 0) { italic_possible = false; }
-            }
-            if (close > i + width) {
-                if (bold) { text_append(b, "<strong>"); } else { text_append(b, "<em>"); }
-                inline_range(b, chars, i + width, close, depth + 1);
-                if (bold) { text_append(b, "</strong>"); } else { text_append(b, "</em>"); }
-                i = close + width; continue;
-            }
-        }
-        escape_char(b, c); i++;
+            i = i + 2;
+        } else if (prefix && c == ':') { scheme_end = i; prefix = false; }
+        else if (c == '/' || c == '?' || c == '#') { prefix = false; }
+        i++;
     }
+    if (scheme_end < 0) { return true; }
+    return ssg_scheme_is(chars, start, scheme_end, "http") || ssg_scheme_is(chars, start, scheme_end, "https") || (!image && ssg_scheme_is(chars, start, scheme_end, "mailto"));
 }
 
-struct MDState { html <TextBuffer>, para <TextBuffer>, in_code <bool>, list <int>, in_quote <bool> }
-
-fun close_para(st: &MDState) <noret> {
-    if (!st.para.ok) { st.html.ok = false; }
-    if (st.para.used > 0) {
-        text_append(&st.html, "<p>");
-        inline_range(&st.html, st.para.bytes, 0, st.para.used, 0);
-        text_append(&st.html, "</p>\n");
-        st.para.used = 0;
-    }
-}
-fun close_list(st: &MDState) <noret> {
-    if (st.list == 1) { text_append(&st.html, "</ul>\n"); }
-    if (st.list == 2) { text_append(&st.html, "</ol>\n"); }
-    st.list = 0;
-}
-fun close_in_quote(st: &MDState) <noret> {
-    if (st.in_quote) { text_append(&st.html, "</blockquote>\n"); st.in_quote = false; }
-}
-fun close_all(st: &MDState) <noret> { close_para(st); close_list(st); close_in_quote(st); }
-fun whitespace(c: char) <bool> { return c == ' ' || c == '\t' || c == '\r'; }
-
-pub fun? md_to_html(md: string) <string> {
-    let chars <[char]> = to_chars(md);
+// Decode the escapes md_escape_html produced, so the allowlist sees the
+// URL the browser will see. Single pass only: "&amp;amp;" decodes to
+// "&amp;", never further, so nested-entity smuggling stays inert.
+// No & present means nothing to decode (fast path, still a fresh clone
+// so callers always own the result).
+fun ssg_check_form(url_esc: string) <string> {
+    if (find(url_esc, "&") < 0) { return clone(url_esc); }
+    let chars <[char]> = to_chars(url_esc);
     let total <int> = chars.length - 1;
-    let st <MDState> = MDState{html: text_buffer(), para: text_buffer(), in_code: false, list: 0, in_quote: false};
-    let start <int> = 0;
-    while (start < total && st.html.ok && st.para.ok) {
-        let end <int> = start;
-        while (end < total && chars[end] != '\n') { end++; }
-        let raw_end <int> = end;
-        if (raw_end > start && chars[raw_end - 1] == '\r') { raw_end--; }
-        let left <int> = start;
-        let right <int> = raw_end;
-        while (left < right && whitespace(chars[left])) { left++; }
-        while (right > left && whitespace(chars[right - 1])) { right--; }
-        let fence <bool> = matches(chars, left, right, "```");
-        if (st.in_code) {
-            if (fence && right - left == 3) { text_append(&st.html, "</code></pre>\n"); st.in_code = false; }
-            else { escape_range(&st.html, chars, start, raw_end); text_char(&st.html, '\n'); }
-        } else if (left == right) { close_all(&st); }
-        else if (fence) { close_all(&st); text_append(&st.html, "<pre><code>\n"); st.in_code = true; }
-        else if (right - left == 3 && matches(chars, left, right, "---")) { close_all(&st); text_append(&st.html, "<hr>\n"); }
-        else if (chars[left] == '>') {
-            close_para(&st); close_list(&st);
-            if (!st.in_quote) { text_append(&st.html, "<blockquote>\n"); st.in_quote = true; }
-            left++;
-            while (left < right && whitespace(chars[left])) { left++; }
-            text_append(&st.html, "<p>"); inline_range(&st.html, chars, left, right, 0); text_append(&st.html, "</p>\n");
+    let out <string> = clone("");
+    let i <int> = 0;
+    while (i < total) {
+        if (chars[i] == '&' && ssg_matches(chars, i, total, "&amp;")) { out = concat(out, "&"); i = i + 5; }
+        else if (chars[i] == '&' && ssg_matches(chars, i, total, "&lt;")) { out = concat(out, "<"); i = i + 4; }
+        else if (chars[i] == '&' && ssg_matches(chars, i, total, "&gt;")) { out = concat(out, ">"); i = i + 4; }
+        else if (chars[i] == '&' && ssg_matches(chars, i, total, "&quot;")) { out = concat(out, "\""); i = i + 6; }
+        else if (chars[i] == '&' && ssg_matches(chars, i, total, "&#39;")) { out = concat(out, "'"); i = i + 5; }
+        else { out = concat(out, from_chars(chars, i, 1)); i++; }
+    }
+    delete chars;
+    return out;
+}
+
+fun ssg_url_safe_escaped(url_esc: string, image: bool) <bool> {
+    let check <string> = ssg_check_form(url_esc);
+    let chars <[char]> = to_chars(check);
+    let ok <bool> = ssg_safe_url_chars(chars, 0, chars.length - 1, image);
+    delete chars; free_str(check);
+    return ok;
+}
+
+fun ssg_url_safe_raw(url: string, image: bool) <bool> {
+    let chars <[char]> = to_chars(url);
+    let ok <bool> = ssg_safe_url_chars(chars, 0, chars.length - 1, image);
+    delete chars;
+    return ok;
+}
+
+// Escape quote characters for emission inside a double-quoted attribute.
+// Inline URLs/alt text are already &<>-escaped by the pipeline, so only
+// quotes are added here (re-escaping & would double-escape &amp;).
+fun ssg_attr_quotes(s: string) <string> {
+    let e <string> = replace(s, "\"", "&quot;");
+    return replace(e, "'", "&#39;");
+}
+
+// Full attribute escaping for RAW strings (ref-link definition URLs).
+fun ssg_attr_escape(s: string) <string> {
+    let e <string> = replace(s, "&", "&amp;");
+    let e2 <string> = replace(e, "<", "&lt;");
+    let e3 <string> = replace(e2, ">", "&gt;");
+    let e4 <string> = replace(e3, "\"", "&quot;");
+    return replace(e4, "'", "&#39;");
+}
+
+// ---------------------------------------------------------------------------
+// Inline rendering
+// ---------------------------------------------------------------------------
+
+// Autolinks, expanded on ALREADY-escaped text: "&lt;https://x&gt;" ->
+// <a href="https://x">https://x</a>. Runs after escaping (so a literal
+// "&lt;" typed by the user shows as "&amp;lt;" and never matches) and
+// before images/links (so it cannot eat their brackets).
+fun md_expand_autolinks(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "&lt;", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_from_i(out, "&gt;", a + 4);
+        if (b < 0) { break; }
+        let inner <string> = substr(out, a + 4, b - a - 4);
+        if (!starts_with(inner, "http://") && !starts_with(inner, "https://")) { pos = a + 4; continue; }
+        if (find(inner, " ") >= 0) { pos = a + 4; continue; }
+        if (!ssg_url_safe_escaped(inner, false)) { pos = a + 4; continue; }
+        let safe <string> = ssg_attr_quotes(inner);
+        let rep <string> = concat("<a href=\"", concat(safe, concat("\">", concat(inner, "</a>"))));
+        out = md_replace_span(out, a, b + 4, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_images(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "![", pos);
+        if (a < 0) { break; }
+        let m <int> = md_find_from_i(out, "](", a + 2);
+        if (m < 0) { break; }
+        let b <int> = md_find_from_i(out, ")", m + 2);
+        if (b < 0) { break; }
+        let alt <string> = substr(out, a + 2, m - a - 2);
+        let url <string> = substr(out, m + 2, b - m - 2);
+        if (!ssg_url_safe_escaped(url, true)) { pos = b + 1; continue; }
+        let safe_url <string> = ssg_attr_quotes(url);
+        let safe_alt <string> = ssg_attr_quotes(alt);
+        let rep <string> = concat("<img src=\"", concat(safe_url, concat("\" alt=\"", concat(safe_alt, "\">"))));
+        out = md_replace_span(out, a, b + 1, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_links(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "[", pos);
+        if (a < 0) { break; }
+        // A leftover image marker (unparseable) is not a link.
+        if (a > 0 && equals(substr(out, a - 1, 1), "!")) { pos = a + 1; continue; }
+        let m <int> = md_find_from_i(out, "](", a + 1);
+        if (m < 0) { pos = a + 1; continue; }
+        let b <int> = md_find_from_i(out, ")", m + 2);
+        if (b < 0) { break; }
+        let text <string> = substr(out, a + 1, m - a - 1);
+        let url <string> = substr(out, m + 2, b - m - 2);
+        if (!ssg_url_safe_escaped(url, false)) { pos = b + 1; continue; }
+        let safe_url <string> = ssg_attr_quotes(url);
+        let rep <string> = concat("<a href=\"", concat(safe_url, concat("\">", concat(text, "</a>"))));
+        out = md_replace_span(out, a, b + 1, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+// Reference-definition id of a trimmed line ("[id]: url..." -> "id"),
+// or "" when the line is not a definition.
+fun md_def_id(t: string) <string> {
+    if (!starts_with(t, "[")) { return ""; }
+    let c <int> = md_find_from_i(t, "]:", 1);
+    if (c < 0) { return ""; }
+    let id <string> = trim(substr(t, 1, c - 1));
+    if (equals(id, "")) { return ""; }
+    return id;
+}
+
+// Reference-definition url of a trimmed line, or "" when not a definition.
+// Supports "<url>" angle destinations and ignores a trailing title.
+fun md_def_url(t: string) <string> {
+    let c <int> = md_find_from_i(t, "]:", 1);
+    if (c < 0) { return ""; }
+    let rest <string> = trim(substr(t, c + 2, len(t) - c - 2));
+    if (equals(rest, "")) { return ""; }
+    if (starts_with(rest, "<")) {
+        let gt <int> = find(rest, ">");
+        if (gt < 0) { return ""; }
+        return substr(rest, 1, gt - 1);
+    }
+    let sp <int> = find(rest, " ");
+    if (sp < 0) { return rest; }
+    return substr(rest, 0, sp);
+}
+
+fun md_is_link_def(t: string) <bool> {
+    let id <string> = md_def_id(t);
+    if (equals(id, "")) { return false; }
+    let url <string> = md_def_url(t);
+    return !equals(url, "");
+}
+
+// Collect one definition line into ids/urls (lowercased ids, first
+// definition wins). Returns the new count.
+fun md_collect_def(t: string, ids: [string], urls: [string], n: int, cap: int) <int> {
+    let id <string> = md_def_id(t);
+    if (equals(id, "")) { return n; }
+    let key <string> = to_lower(id);
+    for (let i <int> = 0; i < n; i++) {
+        if (equals(ids[i], key)) { return n; }
+    }
+    if (n >= cap) { return n; }
+    let url <string> = md_def_url(t);
+    if (equals(url, "")) { return n; }
+    ids[n] = key;
+    urls[n] = url;
+    return n + 1;
+}
+
+// Url for a definition id (trimmed + lowercased), or "" when undefined.
+fun md_ref_lookup(ids: [string], urls: [string], n: int, id: string) <string> {
+    let key <string> = to_lower(trim(id));
+    for (let i <int> = 0; i < n; i++) {
+        if (equals(ids[i], key)) { return urls[i]; }
+    }
+    return "";
+}
+
+// Reference links: [text][id], [text][] (id = text), [text] (shortcut).
+// Runs after inline links, so [text](url) forms are already consumed.
+fun md_expand_ref_links(s: string, ids: [string], urls: [string], ndefs: int) <string> {
+    if (ndefs <= 0) { return s; }
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "[", pos);
+        if (a < 0) { break; }
+        if (a > 0 && equals(substr(out, a - 1, 1), "!")) { pos = a + 1; continue; }
+        let m <int> = md_find_from_i(out, "]", a + 1);
+        if (m < 0) { break; }
+        if (m == a + 1) { pos = a + 1; continue; }
+        let text <string> = substr(out, a + 1, m - a - 1);
+        let url <string> = "";
+        let end <int> = -1;
+        if (m + 1 < len(out) && equals(substr(out, m + 1, 1), "[")) {
+            let c <int> = md_find_from_i(out, "]", m + 2);
+            if (c < 0) { pos = a + 1; continue; }
+            let idpart <string> = substr(out, m + 2, c - m - 2);
+            if (equals(idpart, "")) { url = md_ref_lookup(ids, urls, ndefs, text); }
+            else { url = md_ref_lookup(ids, urls, ndefs, idpart); }
+            end = c;
         } else {
-            close_in_quote(&st);
-            let heading <int> = 0;
-            while (left + heading < right && chars[left + heading] == '#' && heading < 4) { heading++; }
-            if (heading > 3 || heading == 0 || left + heading >= right || chars[left + heading] != ' ') { heading = 0; }
-            let list <int> = 0;
-            let item <int> = left;
-            if (left + 1 < right && (chars[left] == '-' || chars[left] == '*') && chars[left + 1] == ' ') { list = 1; item = left + 2; }
-            else {
-                let digit <int> = left;
-                while (digit < right && chars[digit] >= '0' && chars[digit] <= '9') { digit++; }
-                if (digit > left && digit + 1 < right && chars[digit] == '.' && chars[digit + 1] == ' ') { list = 2; item = digit + 2; }
-            }
-            if (heading > 0) {
-                close_all(&st);
-                text_append(&st.html, "<h"); text_char(&st.html, cast<char>(cast<int>('0') + heading)); text_char(&st.html, '>');
-                inline_range(&st.html, chars, left + heading + 1, right, 0);
-                text_append(&st.html, "</h"); text_char(&st.html, cast<char>(cast<int>('0') + heading)); text_append(&st.html, ">\n");
-            } else if (list > 0) {
-                close_para(&st);
-                if (st.list != list) {
-                    close_list(&st); st.list = list;
-                    if (list == 1) { text_append(&st.html, "<ul>\n"); } else { text_append(&st.html, "<ol>\n"); }
-                }
-                text_append(&st.html, "<li>"); inline_range(&st.html, chars, item, right, 0); text_append(&st.html, "</li>\n");
+            url = md_ref_lookup(ids, urls, ndefs, text);
+            end = m;
+        }
+        if (equals(url, "")) { pos = a + 1; continue; }
+        if (!ssg_url_safe_raw(url, false)) { pos = a + 1; continue; }
+        let safe_url <string> = ssg_attr_escape(url);
+        let rep <string> = concat("<a href=\"", concat(safe_url, concat("\">", concat(text, "</a>"))));
+        out = md_replace_span(out, a, end + 1, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_bold_italic(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_tag_aware(out, "***", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_tag_aware(out, "***", a + 3);
+        if (b < 0) { break; }
+        if (b == a + 3) { pos = a + 3; continue; }
+        let inner <string> = substr(out, a + 3, b - a - 3);
+        let rep <string> = concat("<strong><em>", concat(inner, "</em></strong>"));
+        out = md_replace_span(out, a, b + 3, rep);
+        pos = a + len(rep);
+    }
+    pos = 0;
+    while (true) {
+        let a <int> = md_find_tag_aware(out, "___", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_tag_aware(out, "___", a + 3);
+        if (b < 0) { break; }
+        if (b == a + 3) { pos = a + 3; continue; }
+        let inner <string> = substr(out, a + 3, b - a - 3);
+        let rep <string> = concat("<strong><em>", concat(inner, "</em></strong>"));
+        out = md_replace_span(out, a, b + 3, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_bold(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_tag_aware(out, "**", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_tag_aware(out, "**", a + 2);
+        if (b < 0) { break; }
+        if (b == a + 2) { pos = a + 2; continue; }  // "****": not a bold span
+        let inner <string> = substr(out, a + 2, b - a - 2);
+        let rep <string> = concat("<strong>", concat(inner, "</strong>"));
+        out = md_replace_span(out, a, b + 2, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_italic(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_tag_aware(out, "*", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_tag_aware(out, "*", a + 1);
+        if (b < 0) { break; }
+        if (b == a + 1) { pos = a + 1; continue; }  // "**" remnant: not italic
+        let inner <string> = substr(out, a + 1, b - a - 1);
+        let rep <string> = concat("<em>", concat(inner, "</em>"));
+        out = md_replace_span(out, a, b + 1, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_strike(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_tag_aware(out, "~~", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_tag_aware(out, "~~", a + 2);
+        if (b < 0) { break; }
+        if (b == a + 2) { pos = a + 2; continue; }  // "~~~~": not a strike span
+        let inner <string> = substr(out, a + 2, b - a - 2);
+        let rep <string> = concat("<del>", concat(inner, "</del>"));
+        out = md_replace_span(out, a, b + 2, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+// Inline rendering for normal text: escape first, then expand markup.
+// Reference links need the document's definitions (ids/urls/ndefs).
+fun md_inline_doc(s: string, ids: [string], urls: [string], ndefs: int) <string> {
+    let e <string> = md_escape_html(s);
+    let e2 <string> = md_expand_autolinks(e);
+    let e3 <string> = md_expand_images(e2);
+    let e4 <string> = md_expand_links(e3);
+    let e5 <string> = md_expand_ref_links(e4, ids, urls, ndefs);
+    let e6 <string> = md_expand_bold_italic(e5);
+    let e7 <string> = md_expand_bold(e6);
+    let e8 <string> = md_expand_italic(e7);
+    return md_expand_strike(e8);
+}
+
+// Full inline pass with document context: `code` spans are escaped
+// literally, everything else goes through md_inline_doc. An unclosed
+// backtick is literal text.
+fun md_inline_full(s: string, ids: [string], urls: [string], ndefs: int) <string> {
+    let out <string> = clone("");
+    let rest <string> = s;
+    let in_code <bool> = false;
+    while (true) {
+        let bt <int> = find(rest, "`");
+        if (bt < 0) {
+            if (in_code) { out = concat(out, "`"); }  // unclosed: literal
+            out = concat(out, md_inline_doc(rest, ids, urls, ndefs));
+            break;
+        }
+        let part <string> = substr(rest, 0, bt);
+        if (in_code) {
+            out = concat(out, concat("<code>", concat(md_escape_html(part), "</code>")));
+        } else {
+            out = concat(out, md_inline_doc(part, ids, urls, ndefs));
+        }
+        in_code = !in_code;
+        rest = substr(rest, bt + 1, len(rest) - bt - 1);
+    }
+    return out;
+}
+
+// Full inline pass: `code` spans are escaped literally, everything else
+// goes through md_inline_doc. An unclosed backtick is literal text.
+// Standalone (no document context), so reference links do not expand here.
+pub fun md_inline(s: string) <string> {
+    let dummy_ids <[string]> = new [string, 1]{};
+    let dummy_urls <[string]> = new [string, 1]{};
+    let out <string> = md_inline_full(s, dummy_ids, dummy_urls, 0);
+    delete dummy_ids;
+    delete dummy_urls;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Block rendering
+// ---------------------------------------------------------------------------
+
+// Writer state threaded through the block loop. para_flags has one char
+// per paragraph line: "H" when the raw line ended with two spaces (hard
+// break), "S" otherwise.
+struct MDState {
+    html <string>,
+    in_code <bool>,
+    in_ul <bool>,
+    in_ol <bool>,
+    in_quote <bool>,
+    para <string>,
+    para_open <bool>,
+    para_flags <string>
+}
+
+// Apply hard breaks to inline-rendered paragraph HTML: the k-th newline
+// in `html` corresponds to the k-th paragraph line break, and becomes
+// "<br>\n" when that line's flag is "H". (A code span spanning two
+// paragraph lines adds an extra newline and shifts later breaks — the
+// one documented hard-break edge case.)
+fun md_apply_hard_breaks(html: string, flags: string) <string> {
+    let out <string> = "";
+    let rest <string> = html;
+    let idx <int> = 0;
+    while (true) {
+        let nl <int> = index_of_char(rest, '\n');
+        if (nl < 0) { out = concat(out, rest); break; }
+        let seg <string> = substr(rest, 0, nl);
+        out = concat(out, seg);
+        if (idx < len(flags) && equals(substr(flags, idx, 1), "H")) {
+            out = concat(out, "<br>\n");
+        } else {
+            out = concat(out, "\n");
+        }
+        idx = idx + 1;
+        rest = substr(rest, nl + 1, len(rest) - nl - 1);
+    }
+    return out;
+}
+
+fun md_close_para(st: &MDState, ids: [string], urls: [string], ndefs: int) <noret> {
+    if (st.para_open) {
+        let rendered <string> = md_inline_full(st.para, ids, urls, ndefs);
+        let final_html <string> = md_apply_hard_breaks(rendered, st.para_flags);
+        st.html = concat(st.html, concat("<p>", concat(final_html, "</p>\n")));
+        st.para = "";
+        st.para_flags = "";
+        st.para_open = false;
+    }
+}
+
+fun md_close_lists(st: &MDState) <noret> {
+    if (st.in_ul) { st.html = concat(st.html, "</ul>\n"); st.in_ul = false; }
+    if (st.in_ol) { st.html = concat(st.html, "</ol>\n"); st.in_ol = false; }
+}
+
+fun md_close_quote(st: &MDState) <noret> {
+    if (st.in_quote) { st.html = concat(st.html, "</blockquote>\n"); st.in_quote = false; }
+}
+
+fun md_close_all(st: &MDState, ids: [string], urls: [string], ndefs: int) <noret> {
+    md_close_para(st, ids, urls, ndefs);
+    md_close_lists(st);
+    md_close_quote(st);
+}
+
+// Split s into lines (handles \n and \r\n), up to `cap`. Returns the count;
+// lines land in out[0..count).
+// Cursor over a document's characters, so documents are never truncated:
+// lines are produced in bounded windows instead of one capped array.
+// (fin-ssg hardening: the old md_split_lines capped at 8192 lines and
+// silently dropped the tail of longer documents.)
+struct MDLineCursor { chars <[char]>, total <int>, pos <int>, done <bool> }
+
+fun md_cursor_new(md: string) <MDLineCursor> {
+    let chars <[char]> = to_chars(md);
+    return MDLineCursor{chars: chars, total: chars.length - 1, pos: 0, done: false};
+}
+
+fun md_cursor_free(cur: &MDLineCursor) <noret> {
+    delete cur.chars;
+}
+
+// Fill out[0..n) with the next up-to-cap lines. A document ending with a
+// newline yields one trailing "" line on the call that exhausts it
+// (matching md_split_lines); the empty document yields one "" line.
+fun md_next_lines(cur: &MDLineCursor, out: [string], cap: int) <int> {
+    let count <int> = 0;
+    while (count < cap && !cur.done) {
+        if (cur.pos >= cur.total) {
+            out[count] = clone("");
+            count++;
+            cur.done = true;
+            break;
+        }
+        let nl <int> = -1;
+        let j <int> = cur.pos;
+        while (j < cur.total) {
+            if (cur.chars[j] == '\n') { nl = j; break; }
+            j++;
+        }
+        let line_end <int> = cur.total;
+        if (nl >= 0) { line_end = nl; }
+        let line <string> = from_chars(cur.chars, cur.pos, line_end - cur.pos);
+        if (ends_with(line, "\r")) {
+            let old <string> = line;
+            line = substr(line, 0, len(line) - 1);
+            free_str(old);
+        }
+        out[count] = line;
+        count++;
+        if (nl < 0) { cur.pos = cur.total; cur.done = true; }
+        else { cur.pos = nl + 1; }
+    }
+    return count;
+}
+
+fun md_all_char(t: string, c: string) <bool> {
+    let total <int> = len(t);
+    if (total == 0) { return false; }
+    for (let i <int> = 0; i < total; i++) {
+        if (!equals(substr(t, i, 1), c)) { return false; }
+    }
+    return true;
+}
+
+// Setext level of a trimmed line: 1 for a run of '=', 2 for a run of '-',
+// else 0. (A single char counts: CommonMark allows 1+ underline chars.)
+fun md_setext_level(t: string) <int> {
+    if (md_all_char(t, "=")) { return 1; }
+    if (md_all_char(t, "-")) { return 2; }
+    return 0;
+}
+
+// Thematic break: a run of 3+ of '-', '*', or '_'.
+fun md_is_hr(t: string) <bool> {
+    if (len(t) < 3) { return false; }
+    if (md_all_char(t, "-")) { return true; }
+    if (md_all_char(t, "*")) { return true; }
+    if (md_all_char(t, "_")) { return true; }
+    return false;
+}
+
+// ATX heading level (1-6) when t is "#"+ text, else 0.
+// Requires a space after the #'s, unless the line is only #'s (empty
+// heading, CommonMark rule).
+fun md_heading_level(t: string) <int> {
+    let total <int> = len(t);
+    let level <int> = 0;
+    while (level < total && level < 6) {
+        if (!equals(substr(t, level, 1), "#")) { break; }
+        level = level + 1;
+    }
+    if (level == 0 || level > 6) { return 0; }
+    if (level >= total) { return level; }
+    if (!equals(substr(t, level, 1), " ")) { return 0; }
+    return level;
+}
+
+// Strip an ATX closing sequence ("Title ##" -> "Title"). Only strips
+// when the trailing #'s are preceded by a space, so "C#" survives.
+fun md_strip_closing_hashes(ht: string) <string> {
+    let total <int> = len(ht);
+    let hashes <int> = 0;
+    while (hashes < total) {
+        if (!equals(substr(ht, total - hashes - 1, 1), "#")) { break; }
+        hashes = hashes + 1;
+    }
+    if (hashes == 0) { return ht; }
+    let before <int> = total - hashes - 1;
+    if (before < 0) { return ""; }
+    if (!equals(substr(ht, before, 1), " ")) { return ht; }
+    return trim_end(substr(ht, 0, total - hashes));
+}
+
+fun md_is_ul_item(t: string) <bool> {
+    return starts_with(t, "- ") || starts_with(t, "* ");
+}
+
+// True when t is an ordered-list item ("N. ...", N numeric).
+fun md_is_ol_item(t: string) <bool> {
+    let dot <int> = index_of_char(t, '.');
+    if (dot <= 0) { return false; }
+    if (!is_numeric(substr(t, 0, dot))) { return false; }
+    return starts_with(substr(t, dot, len(t) - dot), ". ");
+}
+
+// Ordered-list item text (after "N. "). Callers check md_is_ol_item first.
+fun md_ol_text(t: string) <string> {
+    let dot <int> = index_of_char(t, '.');
+    return trim(substr(t, dot + 2, len(t) - dot - 2));
+}
+
+// Render a whole Markdown document to an HTML fragment (no <html> wrapper).
+pub fun md_to_html(md: string) <string> {
+    let cur <MDLineCursor> = md_cursor_new(md);
+    let chunk <int> = 8192;
+    let lines <[string]> = new [string, chunk]{};
+    // Pre-pass: collect reference-link definitions (fence-aware, so a
+    // definition-looking line inside a fenced block stays code). Chunked
+    // like the block pass below: no line cap, fence state persists.
+    let defcap <int> = 512;
+    let def_ids <[string]> = new [string, defcap]{};
+    let def_urls <[string]> = new [string, defcap]{};
+    let ndefs <int> = 0;
+    let in_fence <bool> = false;
+    while (!cur.done) {
+        let n <int> = md_next_lines(&cur, lines, chunk);
+        for (let d <int> = 0; d < n; d++) {
+            let dt <string> = trim(lines[d]);
+            if (starts_with(dt, "```")) { in_fence = !in_fence; }
+            else if (!in_fence) { ndefs = md_collect_def(dt, def_ids, def_urls, ndefs, defcap); }
+            free_str(lines[d]);
+        }
+    }
+    cur.pos = 0;
+    cur.done = false;
+    let st <MDState> = MDState{
+        html: clone(""),
+        in_code: false,
+        in_ul: false,
+        in_ol: false,
+        in_quote: false,
+        para: "",
+        para_open: false,
+        para_flags: ""
+    };
+    while (!cur.done) {
+        let n <int> = md_next_lines(&cur, lines, chunk);
+        for (let i <int> = 0; i < n; i++) {
+        let raw <string> = lines[i];
+        let t <string> = trim(raw);
+        if (st.in_code) {
+            if (equals(t, "```")) {
+                st.html = concat(st.html, "</code></pre>\n");
+                st.in_code = false;
             } else {
-                close_list(&st);
-                if (st.para.used > 0) { text_char(&st.para, '\n'); }
-                text_range(&st.para, chars, left, right);
+                // Raw line: indentation is significant inside code.
+                st.html = concat(st.html, concat(md_escape_html(raw), "\n"));
+            }
+        } else if (equals(t, "")) {
+            md_close_all(&st, def_ids, def_urls, ndefs);
+        } else if (starts_with(t, "```")) {
+            md_close_all(&st, def_ids, def_urls, ndefs);
+            let langfull <string> = trim(substr(t, 3, len(t) - 3));
+            let sp <int> = find(langfull, " ");
+            let lang <string> = langfull;
+            if (sp >= 0) { lang = substr(langfull, 0, sp); }
+            lang = replace(lang, "\"", "");
+            if (equals(lang, "")) {
+                st.html = concat(st.html, "<pre><code>\n");
+            } else {
+                st.html = concat(st.html, concat("<pre><code class=\"language-", concat(md_escape_html(lang), "\">\n")));
+            }
+            st.in_code = true;
+        } else if (md_setext_level(t) > 0 && st.para_open) {
+            // Setext heading: the open paragraph becomes the heading.
+            // (Checked before hr: a "---" run under text is h2, not <hr>.)
+            md_close_lists(&st);
+            md_close_quote(&st);
+            let tag <string> = "h2";
+            if (md_setext_level(t) == 1) { tag = "h1"; }
+            let ht <string> = md_inline_full(st.para, def_ids, def_urls, ndefs);
+            st.html = concat(st.html, concat(concat("<", tag), concat(">", concat(ht, concat("</", concat(tag, ">\n"))))));
+            st.para = "";
+            st.para_flags = "";
+            st.para_open = false;
+        } else if (md_is_hr(t)) {
+            md_close_all(&st, def_ids, def_urls, ndefs);
+            st.html = concat(st.html, "<hr>\n");
+        } else if (md_is_link_def(t)) {
+            // Definition line: consumed by the pre-pass, renders nothing,
+            // and does NOT interrupt an open paragraph.
+        } else if (starts_with(t, ">")) {
+            md_close_para(&st, def_ids, def_urls, ndefs);
+            md_close_lists(&st);
+            if (!st.in_quote) {
+                st.html = concat(st.html, "<blockquote>\n");
+                st.in_quote = true;
+            }
+            let q <string> = trim(substr(t, 1, len(t) - 1));
+            st.html = concat(st.html, concat("<p>", concat(md_inline_full(q, def_ids, def_urls, ndefs), "</p>\n")));
+        } else {
+            md_close_quote(&st);
+            let hl <int> = md_heading_level(t);
+            if (hl > 0) {
+                md_close_all(&st, def_ids, def_urls, ndefs);
+                let ht <string> = "";
+                if (hl < len(t)) {
+                    ht = md_strip_closing_hashes(trim(substr(t, hl + 1, len(t) - hl - 1)));
+                }
+                let tag <string> = "h3";
+                if (hl == 1) { tag = "h1"; }
+                if (hl == 2) { tag = "h2"; }
+                if (hl == 4) { tag = "h4"; }
+                if (hl == 5) { tag = "h5"; }
+                if (hl == 6) { tag = "h6"; }
+                st.html = concat(st.html, concat(concat("<", tag), concat(">", concat(md_inline_full(ht, def_ids, def_urls, ndefs), concat("</", concat(tag, ">\n"))))));
+            } else if (md_is_ul_item(t)) {
+                md_close_para(&st, def_ids, def_urls, ndefs);
+                if (st.in_ol) { md_close_lists(&st); }
+                if (!st.in_ul) {
+                    st.html = concat(st.html, "<ul>\n");
+                    st.in_ul = true;
+                }
+                let item <string> = trim(substr(t, 2, len(t) - 2));
+                st.html = concat(st.html, concat("<li>", concat(md_inline_full(item, def_ids, def_urls, ndefs), "</li>\n")));
+            } else if (md_is_ol_item(t)) {
+                md_close_para(&st, def_ids, def_urls, ndefs);
+                if (st.in_ul) { md_close_lists(&st); }
+                if (!st.in_ol) {
+                    st.html = concat(st.html, "<ol>\n");
+                    st.in_ol = true;
+                }
+                let ol <string> = md_ol_text(t);
+                st.html = concat(st.html, concat("<li>", concat(md_inline_full(ol, def_ids, def_urls, ndefs), "</li>\n")));
+            } else {
+                // Paragraph line: accumulate, join with newline. The flag
+                // records a hard break (raw line ends with two spaces).
+                md_close_lists(&st);
+                let flag <string> = "S";
+                if (ends_with(raw, "  ")) { flag = "H"; }
+                if (st.para_open) {
+                    st.para = concat(st.para, concat("\n", t));
+                    st.para_flags = concat(st.para_flags, flag);
+                } else {
+                    st.para = t;
+                    st.para_flags = flag;
+                    st.para_open = true;
+                }
             }
         }
-        start = end + 1;
+        free_str(raw);
+        }
     }
-    if (st.in_code) { text_append(&st.html, "</code></pre>\n"); }
-    close_all(&st);
-    delete st.para.bytes;
-    delete chars;
-    return text_finish(&st.html);
+    // An unclosed fence still gets its closing tags (degraded, not broken).
+    if (st.in_code) {
+        st.html = concat(st.html, "</code></pre>\n");
+        st.in_code = false;
+    }
+    md_close_all(&st, def_ids, def_urls, ndefs);
+    delete lines;
+    md_cursor_free(&cur);
+    for (let k <int> = 0; k < ndefs; k++) {
+        free_str(def_ids[k]);
+        free_str(def_urls[k]);
+    }
+    delete def_ids;
+    delete def_urls;
+    return st.html;
 }
+
 }

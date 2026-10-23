@@ -37,8 +37,15 @@ def expect(condition, label):
 def build(compiler, stdlib, source, output, extra=()):
     # The vendored modules are found through the include path, the way the
     # generator itself finds them.
-    command = [compiler, source, "-I", ROOT / "src" / "vendor",
-               "--fin-libs", stdlib, "-o", output]
+    # NOTE: --fin-libs must be omitted entirely when empty. finc treats an
+    # explicitly passed empty --fin-libs as "search ONLY this path", which
+    # drops the built-in stdlib and fails with "module not found: argparse /
+    # fs / strings" (this broke CI's smoke step even though the plain
+    # `finc -I src/vendor src/main.fin -o fin-ssg` build step passed).
+    command = [compiler, source, "-I", ROOT / "src" / "vendor"]
+    if stdlib:
+        command += ["--fin-libs", stdlib]
+    command += ["-o", output]
     run([*command, *extra], cwd=ROOT)
 
 
@@ -62,7 +69,10 @@ def main():
         binary = work / ("fin-ssg.exe" if os.name == "nt" else "fin-ssg")
 
         print("== frontend check ==", flush=True)
-        run([compiler, "-I", vendor, "--fin-libs", stdlib, ROOT / "src" / "main.fin"], cwd=ROOT)
+        frontend = [compiler, "-I", vendor]
+        if stdlib:
+            frontend += ["--fin-libs", stdlib]
+        run([*frontend, ROOT / "src" / "main.fin"], cwd=ROOT)
 
         print(f"== codegen + link {options.opt} ==", flush=True)
         build(compiler, stdlib, ROOT / "src" / "main.fin", binary, [options.opt])
@@ -84,7 +94,12 @@ def main():
                          "<em>fin-ssg</em>", "<code>inline code</code>",
                          '<a href="https://github.com/M1778/Fin">links</a>',
                          "<li>unordered item one</li>", "<li>first ordered item</li>",
-                         "<blockquote>", "<pre><code>", "<hr>"):
+                         "<blockquote>",
+                         # fin-markdown emits the fence info string as a
+                         # language class (adopted 2026-10-23); the old
+                         # vendored renderer dropped it and always emitted
+                         # bare <pre><code>. The example fence is ```fin.
+                         '<pre><code class="language-fin">', "<hr>"):
             expect(fragment in hello, f"hello.html carries {fragment!r}")
         expect("second" in (site / "second.html").read_text(encoding="utf-8"),
                "second.html carries its title")
