@@ -1,38 +1,52 @@
-// Pure mappings run on every host; detection exercises the current host ABI.
-import { OpenFlags, linux_open_flags, detect_open_flags } from platform::fin;
+// Pure ABI mappings run on every host; file checks exercise the native ABI.
+import { TargetAbi, DirHandle, FileHandle, posix_abi, detect_target_abi, platform_open_directory, open_in_directory, name_kind, is_regular_file, file_close } from platform::fin;
 
 fun rejected(system: string, machine: string) <noret> {
-    let flags <OpenFlags> = linux_open_flags(system, machine);
-    blame !flags.ok;
-    blame flags.directory == 0 && flags.read_file == 0 && flags.create_file == 0;
+    let abi <TargetAbi> = posix_abi(system, machine);
+    blame !abi.ok;
+    blame abi.directory == 0 && abi.read_file == 0 && abi.create_file == 0;
 }
 
 fun main() <int> {
-    let x86 <OpenFlags> = linux_open_flags("Linux", "x86_64");
+    let x86 <TargetAbi> = posix_abi("Linux", "x86_64");
     blame x86.ok;
     blame x86.directory == 524288 + 65536 + 131072;
     blame x86.read_file == 524288 + 2048 + 131072;
     blame x86.create_file == 524288 + 131072 + 1 + 64 + 128;
-    let arm <OpenFlags> = linux_open_flags("Linux", "aarch64");
+    blame x86.stat_mode_offset == 24 && x86.nofollow_flag == 256;
+    let arm <TargetAbi> = posix_abi("Linux", "aarch64");
     blame arm.ok;
-    blame arm.directory == 573440;
-    blame arm.read_file == 559104;
-    blame arm.create_file == 557249;
+    blame arm.directory == 573440 && arm.read_file == 559104 && arm.create_file == 557249;
     blame (arm.directory & 16384) != 0 && (arm.directory & 32768) != 0;
-    blame (arm.directory & 65536) == 0; // ARM64 O_DIRECT must not be enabled.
-    blame (arm.read_file & 32768) != 0 && (arm.create_file & 32768) != 0;
+    blame (arm.directory & 65536) == 0;
+    blame arm.stat_mode_offset == 16 && arm.nofollow_flag == 256;
+    let darwin <TargetAbi> = posix_abi("Darwin", "arm64");
+    blame darwin.ok;
+    blame darwin.directory == 16777216 + 1048576 + 256;
+    blame darwin.read_file == 16777216 + 256 + 4;
+    blame darwin.create_file == 16777216 + 256 + 1 + 512 + 2048;
+    blame darwin.stat_mode_offset == 4 && darwin.nofollow_flag == 32;
+    let intel_mac <TargetAbi> = posix_abi("Darwin", "x86_64");
+    blame intel_mac.ok && intel_mac.stat_mode_offset == 4;
     rejected("Linux", "riscv64");
     rejected("Linux", "i686");
     rejected("Linux", "armv7l");
     rejected("Linux", "aarch64_be");
     rejected("Linux", "");
-    rejected("Darwin", "x86_64");
+    rejected("Darwin", "aarch64");
     rejected("FreeBSD", "aarch64");
-    let host <OpenFlags> = detect_open_flags();
+    let host <TargetAbi> = detect_target_abi();
     blame host.ok;
-    #c_ifdef FIN_TARGET_LINUX
-    blame host.directory == x86.directory || host.directory == arm.directory;
-    #c_endif
-    printf("open-flag mapping and host detection tests passed\n");
+    let dir <DirHandle> = platform_open_directory("example/layout", false, host);
+    blame dir >= 0;
+    blame name_kind(dir, "page.html", host) == 1;
+    blame name_kind(dir, "missing.html", host) == 0;
+    let file <FileHandle> = open_in_directory(dir, "page.html", false, host);
+    blame file >= 0;
+    blame is_regular_file(file, host);
+    blame !is_regular_file(dir, host);
+    blame file_close(file);
+    blame file_close(dir);
+    printf("ABI mappings, native file classification and handle close passed\n");
     return 0;
 }

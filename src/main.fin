@@ -1,11 +1,11 @@
-// Native Fin SSG. Linux/procfs required. Content and layout files are read
-// through nofollow directory descriptors; publication is atomic per file.
+// Native Fin SSG. Inputs are read through nofollow directory handles;
+// publication is atomic per file.
 import { ArgParser, new_arg_parser, free_arg_parser } from argparse::std;
 import { walk_dir } from fs::std;
 import { len, equals, ends_with, substr, concat, clone, to_lower, to_chars, from_chars, free_str, compare } from strings::std;
 import { TextBuffer, text_buffer, text_char, text_append, text_finish, md_to_html, md_escape_into, filename_url } from markdown::fin;
 import { tpl_render } from template::fin;
-import { OpenFlags, DirHandle, FileHandle, detect_open_flags, platform_open_directory, open_in_directory, is_regular_file, name_kind, file_read, file_write, file_flush, file_close, rename_in_directory, unlink_in_directory, directory_flush, directory_path, platform_pid, platform_error_is_missing, platform_error_is_exists } from platform::fin;
+import { TargetAbi, DirHandle, FileHandle, detect_target_abi, platform_open_directory, open_in_directory, is_regular_file, name_kind, file_read, file_write, file_flush, file_close, rename_in_directory, unlink_in_directory, directory_flush, directory_path, platform_pid, platform_error_is_missing, platform_error_is_exists } from platform::fin;
 
 const MAX_ARGS <int> = 256;
 const MAX_ARG_BYTES <int> = 65536;
@@ -42,15 +42,15 @@ fun free_argv(argv: &Argv) <noret> {
 // Whether a name inside a directory is a regular file: 1 regular, 0 missing,
 // -1 special/symlink/error. The descriptor is asked about the name itself,
 // so a symlink is never followed to find out.
-fun regular_file(dir: DirHandle, name: string, abi: OpenFlags) <int> {
-    return name_kind(dir, name);
+fun regular_file(dir: DirHandle, name: string, abi: TargetAbi) <int> {
+    return name_kind(dir, name, abi);
 }
 
-fun? read_file(dir: DirHandle, name: string, abi: OpenFlags) <string> {
+fun? read_file(dir: DirHandle, name: string, abi: TargetAbi) <string> {
     if (!abi.ok) { return null; }
     let file <FileHandle> = open_in_directory(dir, name, false, abi);
     if (file < 0) { return null; }
-    if (!is_regular_file(file)) { file_close(file); return null; }
+    if (!is_regular_file(file, abi)) { file_close(file); return null; }
     let buf <[char]> = new [char, MAX_INPUT + 1]{};
     let used <int> = 0;
     let ok <bool> = true;
@@ -71,7 +71,7 @@ fun? read_file(dir: DirHandle, name: string, abi: OpenFlags) <string> {
 
 // Exclusive temp creation and rename relative to the same pinned directory.
 // Reject existing special files. A raced-in symlink is replaced, never followed.
-fun atomic_write(dir: DirHandle, dest: string, text: string, abi: OpenFlags) <bool> {
+fun atomic_write(dir: DirHandle, dest: string, text: string, abi: TargetAbi) <bool> {
     if (!abi.ok) { return false; }
     if (regular_file(dir, dest, abi) < 0) { return false; }
     let temp <string> = "";
@@ -190,7 +190,7 @@ fun print_usage() <noret> {
     printf("usage: fin-ssg [--content DIR] [--layout DIR] [--out DIR] [--title TITLE]\n");
     printf("Aliases: -c, -l, -o, -t; --help/-h. Defaults: content, layout, public, My Site.\n");
     printf("Limits: 256 arguments / 65536 argv bytes, 4096 Markdown files, 4 MiB per input, 32 MiB per rendered output.\n");
-    printf("Linux x86_64/aarch64, procfs and statx required; symlink paths and '..' components refused. Layouts are trusted HTML.\n");
+    printf("Linux x86_64/aarch64, macOS and Windows; symlink paths and '..' components refused. Layouts are trusted HTML.\n");
 }
 
 // Reserve the generated homepage and reject ASCII case-folded collisions so
@@ -216,8 +216,8 @@ fun safe_names(files: &FileList) <bool> {
     return ok;
 }
 
-fun build_site(content: string, layout_dir: string, out: string, title: string, abi: OpenFlags) <int> {
-    let input <int> = platform_open_directory(content, false, abi);
+fun build_site(content: string, layout_dir: string, out: string, title: string, abi: TargetAbi) <int> {
+    let input <DirHandle> = platform_open_directory(content, false, abi);
     if (input < 0) { printf("error: content must be a readable, non-symlink directory: %s\n", content); return 1; }
     let files <FileList> = list_md_files(input);
     if (!files.ok || files.count == 0) {
@@ -230,7 +230,7 @@ fun build_site(content: string, layout_dir: string, out: string, title: string, 
         free_files(&files); file_close(input); return 1;
     }
     let layout <string> = clone(default_layout());
-    let layout_fd <int> = platform_open_directory(layout_dir, false, abi);
+    let layout_fd <DirHandle> = platform_open_directory(layout_dir, false, abi);
     let layout_error <bool> = false;
     if (layout_fd < 0) {
         if (!platform_error_is_missing()) { layout_error = true; }
@@ -248,7 +248,7 @@ fun build_site(content: string, layout_dir: string, out: string, title: string, 
         printf("error: unsafe/unreadable layout or input exceeds 4 MiB\n");
         free_str(layout); free_files(&files); file_close(input); return 1;
     }
-    let output <int> = platform_open_directory(out, true, abi);
+    let output <DirHandle> = platform_open_directory(out, true, abi);
     if (output < 0) {
         printf("error: cannot open/create non-symlink output directory: %s\n", out);
         free_str(layout); free_files(&files); file_close(input); return 1;
@@ -306,8 +306,8 @@ fun build_site(content: string, layout_dir: string, out: string, title: string, 
 }
 
 fun main(args: [string]) <int> {
-    let abi <OpenFlags> = detect_open_flags();
-    if (!abi.ok) { printf("error: cannot select safe Linux open flags; refusing filesystem access\n"); return 1; }
+    let abi <TargetAbi> = detect_target_abi();
+    if (!abi.ok) { printf("error: cannot select the native filesystem ABI; refusing filesystem access\n"); return 1; }
     let ap <ArgParser> = new_arg_parser("fin-ssg", "Static site generator");
     ap.add_option("--content", "-c", "content", "content directory");
     ap.add_option("--layout", "-l", "layout", "layout directory");
