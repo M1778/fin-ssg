@@ -1,0 +1,97 @@
+// =============================================================================
+// Fin Programming Language
+//
+// Made with ❤️ for someone special.
+//
+// This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+// Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+// Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+// “Love is the reason this project exists”
+// -----------------------------------------------------------------------------
+// Author: M1778
+// Repository: https://github.com/M1778/fin-ssg
+// Profile: https://github.com/M1778M/
+// -----------------------------------------------------------------------------
+// Copyright (C) 2027 M1778
+//
+// This file is part of fin-ssg, a project for the Fin Programming Language.
+//
+// Licensed under the MIT License. See LICENSE in the repository root.
+//
+// SPDX-License-Identifier: MIT
+// =============================================================================
+
+// Library-level regression tests: the renderer and template engine on their own.
+//
+// `tests/e2e.py` proves the tool produces a correct site. This proves the two
+// libraries the tool depends on still behave when called directly, so a swap
+// of either is caught here instead of appearing as a page diff. Every check is
+// a `blame`, which aborts with its message, and the last line is printed only
+// when all of them passed.
+import { md_to_html, md_escape_html, md_escape_into, TextBuffer, text_buffer, text_append, text_finish } from markdown::fin;
+import { tpl_render } from template::fin;
+import { len, free_str, to_chars } from strings::std;
+
+fun main() <int> {
+    // Text is escaped; a tag in the input is data, not markup.
+    let escaped <string> = md_to_html("A & B <script>x</script> \"q\"");
+    blame len(escaped) > 0;
+    blame !contains(escaped, "<script>");
+    blame contains(escaped, "&lt;script&gt;");
+    blame contains(escaped, "&amp;");
+    free_str(escaped);
+
+    // A heading and emphasis reach the documented tags.
+    let markup <string> = md_to_html("# Title\n\n**bold** and *italic*\n");
+    blame contains(markup, "<h1>Title</h1>");
+    blame contains(markup, "<strong>bold</strong>");
+    blame contains(markup, "<em>italic</em>");
+    free_str(markup);
+
+    // The escaping helper escapes all four characters that matter.
+    let helper <string> = md_escape_html("<>&\"");
+    blame contains(helper, "&lt;");
+    blame contains(helper, "&gt;");
+    blame contains(helper, "&amp;");
+    free_str(helper);
+
+    // Metadata is auto-escaped; only `content` is trusted markup.
+    let page <string> = tpl_render("{{title}}|{{content}}", "Site", "T <x>", "D", "<b>body</b>");
+    blame contains(page, "T &lt;x&gt;");
+    blame contains(page, "<b>body</b>");
+    blame !contains(page, "{{content}}");
+    free_str(page);
+
+    // The buffer the index is built with appends and finishes in order.
+    let buffer <TextBuffer> = text_buffer();
+    text_append(&buffer, "a");
+    md_escape_into(&buffer, "<b>");
+    text_append(&buffer, "c");
+    let built? <string> = text_finish(&buffer);
+    blame built != null;
+    blame contains(built?, "a&lt;b&gt;c");
+    free_str(built?);
+
+    printf("library tests passed\n");
+    return 0;
+}
+
+// Substring test on the bytes, because indexing a `string` is not an operation
+// Fin has: an array of `char` is.
+fun contains(haystack: string, needle: string) <bool> {
+    let h <[char]> = to_chars(haystack);
+    let n <[char]> = to_chars(needle);
+    let total <int> = h.length - 1;
+    let size <int> = n.length - 1;
+    let found <bool> = false;
+    let i <int> = 0;
+    while (i + size <= total && !found) {
+        let j <int> = 0;
+        while (j < size && h[i + j] == n[j]) { j++; }
+        if (j == size) { found = true; }
+        i++;
+    }
+    delete h;
+    delete n;
+    return found;
+}

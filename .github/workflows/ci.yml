@@ -1,139 +1,144 @@
 name: CI
 
-# The compiler comes from a pinned published release, not from a source build.
-#
-# This used to clone M1778/Fin and run ./build.sh, which cost twenty minutes per job and
-# needed Conan, CMake, Flex, Bison and LLVM 22 on every runner. It also tested whatever the
-# compiler's master happened to be at the time, so a red run could not be attributed without
-# reading a second repository.
-#
-# FINC_VERSION pins it; .github/scripts/install_finc.py verifies the archive's sha256 against
-# the release index before unpacking. On Linux it takes the static musl build, which needs no
-# LLVM runtime on the runner.
-
+# Three platforms, and every one compiles the generator, runs the library
+# tests, builds the example site and asserts on the published files. A lane
+# that only type-checked would not be testing this project.
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, production/hardening]
   pull_request:
+  workflow_dispatch:
 
-permissions:
-  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # A toolchain download plus a full site build is minutes, not tens.
+    timeout-minutes: 20
     strategy:
-      # One platform's failure must not cancel the others: finding out which platforms are
-      # broken is the point.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # `ldflags` is the value FIN_LDFLAGS takes, and the values differ
+        # because finc puts -lLLVM-22 on every POSIX link line and a runner has
+        # no LLVM development library; FIN_LDFLAGS replaces that whole list.
+        # It is a matrix value rather than an expression because an empty
+        # string is falsy in a GitHub expression, so `A && '' || B` yields B.
+        include:
+          # The "-latest" labels are the ones that actually receive runners in
+          # this account; a pinned `macos-14` sat unassigned and was cancelled
+          # at zero seconds, which reads as a failure but proves nothing.
+          - name: linux-x86_64
+            os: ubuntu-latest
+            ldflags: "-lm"
+          - name: macos-arm64
+            os: macos-latest
+            ldflags: "-lm"
+          - name: windows-x86_64
+            os: windows-latest
+            ldflags: "-llegacy_stdio_definitions"
+
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-
-      # The released artifact is not self-contained on every platform: the glibc builds need
-      # libLLVM.so.22 and the macOS builds name an absolute Homebrew keg. Without it the
-      # loader aborts before main and the failure reads as a broken compiler. On Linux and
-      # macOS the installer installs the runtime the artifact actually needs; on Windows
-      # LLVM is linked in and this does nothing.
-      - name: Install the LLVM runtime the artifact needs
+      # The version under test is one file, and the shared installer verifies
+      # the archive's sha256 against the published index before unpacking it.
+      # On Linux it picks the musl artifact, which is static: the glibc one
+      # links libLLVM.so.22.1 and does not start without it.
+      # The shared installer ends with `::add-path::`, which the runner now
+      # rejects as a disabled command and which fails the step. The PATH is
+      # set by the next step through $GITHUB_PATH instead, so the line is
+      # filtered out here rather than the shared script being forked.
+      #
+      # The published macOS artifact is linked against Homebrew's LLVM 22
+      # (/opt/homebrew/opt/llvm@22/lib/libLLVM.dylib), so that keg must exist
+      # before the compiler can run at all. The Linux musl artifact is static
+      # and needs nothing; the glibc one is avoided for this same reason.
+      - name: Install the LLVM the macOS artifact links against
+        if: runner.os == 'macOS'
         shell: bash
-        run: python .github/scripts/install_finc_runtime.py
+        run: brew install llvm@22
 
-      - name: Install the pinned finc
+      - name: Install finc
         shell: bash
-        run: python .github/scripts/install_finc.py --dest "$RUNNER_TEMP/finc"
+        run: |
+          set -o pipefail
+          python3 .github/scripts/install_finc.py | grep -v '^::add-path::'
 
+      # $GITHUB_PATH takes a native path: a POSIX-form path written from bash
+      # is unusable to a native Windows Python, which is what runs the tests.
       - name: Put finc on PATH
         shell: bash
         run: |
-          echo "$RUNNER_TEMP/finc/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/finc/bin/finc" --version
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "$(cygpath -w "$PWD/.finc/bin")" >> "$GITHUB_PATH"
+          else
+            echo "$PWD/.finc/bin" >> "$GITHUB_PATH"
+          fi
 
-      - name: Type-check the entrypoint
-        shell: bash
-        run: finc -I src/vendor src/main.fin
-
-      # A branch only one platform parses cannot be found wrong by any other lane. Two
-      # syntax errors in the Windows branch of platform.fin shipped before this check existed
-      # (a hard-keyword parameter, and a hex literal, which Fin has none of), and each cost a
-      # ten-minute CI round trip that reported one error at a time.
-      #
-      # This flips the guards so the other platform's branch becomes the live one, runs the
-      # front end here, and restores the file. `@define`d C functions never link and do not
-      # need to: a lexical, syntactic or type error is found before code generation.
-      - name: Type-check the branch this platform cannot compile
+      - name: Verify the installed compiler
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            # platform.fin guards only FIN_TARGET_WINDOWS and lets `#c_else` be POSIX, so the
-            # Windows lane already compiles the branch that used to go unchecked, and the
-            # branch it cannot see is the one this host can.
-            echo "nothing to flip here: this lane compiles the guard the check exists for"
-            exit 0
-          fi
-          python tests/tools/check_foreign_branches.py --finc finc \
-            --file src/vendor/platform.fin --needle FIN_TARGET_WINDOWS \
-            --entry src/main.fin --include src/vendor
+          finc --version
+          finc --version | grep -q 'contract 3'
 
-      # tests/smoke.py builds the example site and asserts on the emitted files, checks the
-      # open-flag mapping, and runs the security, CLI, filesystem and limits regressions. It is
-      # invoked through smoke.sh so the invocation lives in one place for local and CI runs.
-      #
-      # Linux only, because that is what the generator supports. `detect_open_flags` reads
-      # `uname` and returns ok:false for anything that is not Linux, and the generator then
-      # reports "requires Linux x86_64 or aarch64" and exits 1. On macOS that is the correct
-      # answer, not a broken build, so this step asserts the refusal instead of expecting the
-      # suite to pass -- a lane that skipped silently would leave the README's platform claim
-      # unbacked either way, and a lane that went red would claim a regression that is not one.
-      - name: Run the smoke and regression suite (Linux)
+      # The header rule is enforced where it can be, not just documented.
+      - name: Source headers
+        shell: bash
+        run: python3 scripts/fin_header.py --repo fin-ssg --license MIT --check src tests scripts
+
+      - name: Frontend check
+        shell: bash
+        run: finc -I src src/main.fin
+
+      # finc links every program against -lLLVM-22 even when the program uses
+      # none of it, and a runner has no LLVM development library. FIN_CC names
+      # the driver and FIN_LDFLAGS replaces the default library list, which is
+      # the documented way to build where that library is absent. The musl
+      # compiler is statically linked, so it needs no LLVM at run time either.
+      - name: Build the generator
+        shell: bash
+        env:
+          FIN_LDFLAGS: ${{ matrix.ldflags }}
+        run: finc -I src src/main.fin -o fin-ssg${{ runner.os == 'Windows' && '.exe' || '' }}
+
+      - name: Library tests
+        shell: bash
+        env:
+          FIN_LDFLAGS: ${{ matrix.ldflags }}
+        run: |
+          finc -I src tests/markdown_test.fin -o markdown-test${{ runner.os == 'Windows' && '.exe' || '' }}
+          ./markdown-test${{ runner.os == 'Windows' && '.exe' || '' }}
+
+      # The suite builds its own copy of the generator and asserts on the
+      # published site, so this step is the one that proves the tool works.
+      - name: Path guards
+        shell: bash
+        env:
+          FIN_LDFLAGS: ${{ matrix.ldflags }}
+        run: |
+          finc -I src tests/platform_guards.fin -o "$RUNNER_TEMP/platform_guards"
+          "$RUNNER_TEMP/platform_guards"
+
+      - name: End-to-end site tests
+        shell: bash
+        env:
+          FIN_LDFLAGS: ${{ matrix.ldflags }}
+        run: python3 -I tests/e2e.py --finc finc
+
+      # The manifest is part of the product: prove the real package manager
+      # can consume it, rather than leaving that claim to a human.
+      - name: finn can consume the manifest
         if: runner.os == 'Linux'
         shell: bash
-        timeout-minutes: 15
-        run: sh tests/smoke.sh
-
-      - name: Assert the documented refusal on this platform (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
+        env:
+          FIN_LDFLAGS: ${{ matrix.ldflags }}
         run: |
-          set -eu
-          finc -I src/vendor src/main.fin -o "$RUNNER_TEMP/fin-ssg"
-          set +e
-          "$RUNNER_TEMP/fin-ssg" -c example/content -l example/layout -o "$RUNNER_TEMP/site" >"$RUNNER_TEMP/err.txt" 2>&1
-          status=$?
-          set -e
-          cat "$RUNNER_TEMP/err.txt"
-          if [ "$status" -eq 0 ]; then
-            echo "::error::the generator succeeded on macOS, so detect_open_flags now supports"
-            echo "::error::it. Update the README's platform table and run the full suite here."
-            exit 1
-          fi
-          # Two lines, and both are the documented shape: the platform it saw, and the
-          # decision it took. Matching only the first would pass on a message that stopped
-          # explaining itself.
-          grep -q "requires Linux" "$RUNNER_TEMP/err.txt" || {
-            echo "::error::macOS failed for a reason other than the documented refusal"
-            exit 1
-          }
-          grep -q "cannot select safe Linux open flags" "$RUNNER_TEMP/err.txt" || {
-            echo "::error::the refusal lost its second line, which says what it did about it"
-            exit 1
-          }
-
-      - name: Assert the Windows build links and refuses (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -eu
-          finc -I src/vendor src/main.fin -o "$RUNNER_TEMP/fin-ssg.exe"
-          # Building is the claim this lane backs: the Windows branch contains @defines for
-          # CreateFileA, MoveFileExA and the rest, and a syntax error in them is invisible on
-          # every other platform. Whether the generator then runs is a separate statement,
-          # and the README says it does not.
-          "$RUNNER_TEMP/fin-ssg.exe" --help > "$RUNNER_TEMP/help.txt" 2>&1 || true
-          cat "$RUNNER_TEMP/help.txt"
+          cargo install finn --git https://github.com/M1778/finn
+          export FIN_COMPILER_PATH="$PWD/.finc/bin/finc"
+          finn build
+          ./out/fin-ssg --help > /dev/null
+          finn test

@@ -1,31 +1,7 @@
 # fin-ssg
 
-A static site generator CLI written in [Fin](https://github.com/M1778/Fin):
-Markdown files in, a static HTML site out. The "Fin is a real tooling
-language" demo — think a tiny Hugo.
-
-> **Verification status:** Native frontend, linking, and execution verified on
-> Linux x86_64 and ARM64 with Fin 0.4.0 (contract 3), at both `-O0` and `-O2`.
-> [Native run 39508662175](https://github.com/M1778/fin-sdk/actions/runs/39508662175)
-> passed this project's smoke, security, and architecture mapping suites on both
-> Linux hosts after correcting the architecture-specific open flags.
-> The generator remains entirely Fin; Python 3 is used only for black-box tests.
->
-> The filesystem layer now selects its calls for the native target, so macOS and
-> Windows are compiled from the same source as Linux. What is verified natively
-> is stated per platform below; the Linux behaviour is unchanged.
->
-> **Verified natively on Linux only.** This repository's CI has one lane, and it is
-> Linux. The macOS and Windows code paths exist and compile, but no lane has executed them,
-> so "compiles from the same source" is not a statement that they run correctly.
->
-> One of them does not, by design: `detect_open_flags` in `src/vendor/platform.fin` reads
-> `uname` and returns `ok: false` for any system that is not Linux, and the generator then
-> reports that it requires Linux x86_64 or aarch64. On macOS that is a refusal, not a
-> silent wrong answer, and it should be read as "not supported yet" rather than as a bug.
-> Windows uses its own flag constants and does not take that path.
-
-## What it does
+A static site generator for [Fin](https://github.com/M1778/Fin): Markdown files
+in, a static HTML site out.
 
 ```
 content/hello.md   ─┐
@@ -34,25 +10,83 @@ layout/page.html   ─┘               public/second.html
                                     public/index.html
 ```
 
-- Reads every `*.md` in the content directory (flat, no recursion).
-- Optional `---` front matter at the top of a file sets `title:` and `date:`.
-  Without it, the title falls back to the file slug.
-- Renders Markdown with fin-markdown (see below), wraps the fragment in
-  `layout/page.html` (`{{site_title}}`, `{{title}}`, `{{date}}`, `{{content}}`
-  slots), and writes `<slug>.html`.
-- Generates `index.html`: the site title plus one link per page.
-- If `layout/page.html` is missing, a minimal built-in layout is used.
+## What it does
 
-## Build
+- Reads every `*.md` file directly inside the content directory (flat, no
+  recursion), in sorted order.
+- An optional `---` front matter block at the top of a file sets `title:` and
+  `date:`. Without one, the title is the file name without `.md`.
+- Renders Markdown to HTML, wraps it in `layout/page.html`, and writes
+  `<name>.html`. The layout has four slots: `{{site_title}}`, `{{title}}`,
+  `{{date}}`, `{{content}}`.
+- Generates `index.html`: the site title plus one link per page, with its date.
+- Uses a minimal built-in layout when `layout/page.html` does not exist.
 
-Requires `finc` 0.4.0+ (contract 3):
+Output is deterministic. Pages are rendered in sorted file-name order, no
+timestamp or process id reaches a published byte, and every file is written
+under a temporary name and renamed into place, so building the same input twice
+produces byte-identical files and a failed write leaves the previous page
+intact.
+
+## What it does not do
+
+- No themes, no template language of its own, no plugins, no incremental
+  builds, no dev server, no watcher, no stale-output cleanup.
+- No nested content directories, no file watching, no drafts, no taxonomies,
+  no RSS, no pagination.
+- It does not sanitise a layout. A layout is trusted HTML written by you; see
+  [Security posture](#security-posture).
+- It cannot tell a symlink from the file it points at: a symlinked `.md` entry
+  is read, and a symlinked output path is replaced by a regular file. A FIFO,
+  socket or device in the content directory is refused with a warning.
+- Nothing is written to a path containing a `..` component.
+
+## Install
+
+Requires **Fin `finc` 1.0.0** (contract 3). `finc` 1.0.1 also works and is what
+this repository is developed against; see [Verification](#verification).
+
+For `finc`, use the published release index:
+<https://github.com/M1778/Fin/releases>. On Linux take the
+**`x86_64-unknown-linux-musl`** archive: it is statically linked. The
+`x86_64-unknown-linux-gnu` archive links `libLLVM.so.22.1` and will not start on
+a machine that does not have that exact shared library (it crashes in the
+dynamic loader, before `main`).
 
 ```sh
-finc -I src/vendor src/main.fin        # frontend check
-finc -I src/vendor src/main.fin -o fin-ssg   # codegen + link
+curl -fL -o finc.tar.gz \
+  https://github.com/M1778/Fin/releases/download/v1.0.0/finc-1.0.0-x86_64-unknown-linux-musl.tar.gz
+mkdir -p finc && tar -xzf finc.tar.gz -C finc
+./finc/bin/finc --version      # finc 1.0.0 (contract 3)
 ```
 
-## Run
+`finc` finds its standard library relative to its own binary (`../lib/std`), so
+extract the whole archive, not just `bin/finc`.
+
+Build fin-ssg. Every module the generator imports is in `src/`, so one `-I`
+finds them all:
+
+```sh
+finc -I src src/main.fin -o fin-ssg     # build
+finc -I src src/main.fin                # type-check only
+```
+
+Building an executable needs a C linker driver: `cc` on Linux and macOS,
+`clang` on a Visual Studio Developer shell on Windows, or whatever `FIN_CC`
+names.
+
+### With the package manager
+
+[`finn`](https://github.com/M1778/finn) reads `finn.toml` here and resolves
+imports as `-I src` plus the standard library:
+
+```sh
+finn build          # -> out/fin-ssg
+finn test           # library tests under tests/
+finn do test        # library tests plus the end-to-end site suite
+```
+
+## Use
 
 ```sh
 ./fin-ssg [--content DIR] [--layout DIR] [--out DIR] [--title TITLE]
@@ -62,137 +96,193 @@ finc -I src/vendor src/main.fin -o fin-ssg   # codegen + link
 | ---- | ------- | ------- |
 | `--content`, `-c` | `content` | directory with `.md` files |
 | `--layout`, `-l` | `layout` | directory holding `page.html` |
-| `--out`, `-o` | `public` | output directory (created if missing) |
+| `--out`, `-o` | `public` | output directory, created if missing (including parents) |
 | `--title`, `-t` | `My Site` | site title for `<title>` and `index.html` |
-| `--help`, `-h` | | show help and exit |
+| `--help`, `-h` | | print usage and exit |
 
-Exit codes: `0` = all pages built, `1` = usage/environment error,
-`2` = some pages failed (each is named; the rest were still built).
+Exit codes: `0` every page was built; `1` usage, environment, or index failure;
+`2` some pages failed (each is named on stdout and the rest were still built).
 
-## Example session
+Limits: 256 arguments / 65,536 argv bytes, 4,096 Markdown files, 4 MiB per
+input file and per layout, 32 MiB per rendered page. Anything over a limit is
+named and refused, never silently truncated.
+
+### A complete example
 
 ```sh
-$ ./fin-ssg --content example/content --layout example/layout \
-            --out public --title "My Fin Blog"
-built example/content/hello.md -> public/hello.html
-built example/content/second.md -> public/second.html
-fin-ssg: 2 page(s) + index -> public/ (0 skipped)
-
-$ ls public
-hello.html  index.html  second.html
+mkdir -p site/content site/layout
+printf -- '---\ntitle: Hello\ndate: 2026-01-01\n---\n\n# Hello, Fin\n\nSome **bold** text.\n' \
+  > site/content/hello.md
+printf '<!DOCTYPE html>\n<html><head><title>{{title}}</title></head>\n<body>{{content}}</body></html>\n' \
+  > site/layout/page.html
+./fin-ssg --content site/content --layout site/layout --out site/public --title "My Site"
 ```
 
-## Markdown subset (v0.1, fin-markdown)
+```output
+built hello.md -> hello.html
+fin-ssg: 1 page(s) + index -> site/public/ (0 skipped)
+```
+
+`site/public/hello.html` then contains the layout with `<h1>Hello, Fin</h1>`
+and `<strong>bold</strong>` in the body, and `site/public/index.html` is a
+generated page listing it.
+
+The repository's own example is [`example/`](example):
+
+```sh
+./fin-ssg --content example/content --layout example/layout \
+          --out public --title "My Fin Blog"
+```
+
+## Public API
+
+The tool is a CLI; `src/` also exposes these modules. All functions are
+`pub`, and every returned string is owned by the caller.
+
+`src/platform.fin` — the filesystem layer the CLI uses:
+
+| Function | Result |
+| -------- | ------ |
+| `open_directory(path, create) <Dir>` | names an existing directory, or creates it (with parents) when `create` is true. `Dir.ok` says whether it is usable. |
+| `close_directory(&Dir)` | releases the directory's name |
+| `name_kind(dir, name) <int>` | `1` readable regular file, `0` missing, `-1` directory/FIFO/socket/device |
+| `read_text(dir, name, limit) <string?>` | the file's text, or null when missing, special, over `limit`, or containing a NUL |
+| `write_atomic(dir, dest, text) <bool>` | writes and renames into place; verifies the published size |
+| `component_ok(name) <bool>` | whether `name` is a single portable path component |
+| `has_parent_step(path) <bool>` | whether a path contains a `..` component |
+
+`src/markdown.fin` — fin-markdown v0.1.0: `md_to_html`, `md_inline`,
+`md_escape_html`, `md_escape_into`, `filename_url`, and the `TextBuffer`
+helpers.
+
+`src/template.fin` — fin-template v0.1.0: `template_from_string`,
+`template_from_file`, `template_render`, `render_string`,
+`template_render_file`, and `tpl_render`, the four-slot entry point this tool
+calls.
+
+## Markdown support
 
 Block: `#`–`######` headings (optional closing hashes), setext headings
-(`===`/`---` under a paragraph line), paragraphs, fenced code blocks
-(\`\`\`, info string emitted as `class="language-x"`), `-`/`*` unordered
-lists, `1.` ordered lists, `>` blockquotes, `---`/`***`/`___` horizontal
-rules, hard breaks (two trailing spaces become `<br>`).
-Inline: \`code\`, `**bold**`, `*italic*`, `***bold italic***`,
+(`===`/`---` under a paragraph), paragraphs, fenced code blocks (```` ``` ````
+with an info string emitted as `class="language-x"`), `-`/`*` unordered lists,
+`1.` ordered lists, `>` blockquotes, `---`/`***`/`___` horizontal rules, hard
+breaks (two trailing spaces become `<br>`).
+
+Inline: `` `code` ``, `**bold**`, `*italic*`, `***bold italic***`,
 `~~strikethrough~~`, `[text](url)`, `![alt](url)`, reference links
-(`[text][id]`, `[text][]`, `[text]` with `[id]: url` definitions anywhere
-in the document), autolinks (`<https://…>`).
-All text and quoted attributes are HTML-escaped. Links allow `http`, `https`,
-`mailto`, and relative URLs; images allow `http`, `https`, and relative URLs.
-Unsafe schemes, control characters, scheme entity obfuscation, protocol-relative
-URLs, and encoded structural/control bytes degrade to literal Markdown.
-Percent-encoded spaces in relative paths remain supported. Filenames are
-URL-encoded in the index, including quotes, spaces, Unicode and newlines.
-Documents of any line count render in full (no line cap); rendered output
-is bounded at 32 MiB per page.
+(`[text][id]`, `[text][]`, `[text]` with `[id]: url` definitions anywhere in
+the document), autolinks (`<https://…>`).
 
-Not supported yet (degrade to literal text, never abort): nested lists,
-tables, indented code blocks, headings deeper than `######`,
-multi-line quote merging, recursive content directories. Emphasis markers
-inside an emitted link/image tag (e.g. `**` in a URL) are never rewritten.
-Layout substitutions are single-pass: metadata containing `{{content}}`
-stays literal and cannot introduce another substitution.
+Not supported, and degraded to literal text rather than aborting: nested lists,
+tables, indented code blocks, headings deeper than `######`, multi-line quote
+merging, link titles, reference images, footnote syntax, underscore emphasis.
 
-## Filesystem safety and limits
+## Security posture
 
-- Linux x86_64 or aarch64, macOS, or Windows. The filesystem calls are chosen
-  for the native target (ADR 0051 addendum): Linux uses `openat`/`fstatat` with
-  the architecture-specific `O_DIRECTORY`/`O_NOFOLLOW` values, which runtime
-  `uname` selects; macOS uses the same `*at` family without `statx`; Windows
-  uses `CreateFileA` with the backup-semantics and open-reparse-point flags.
-  An unknown Linux architecture fails explicitly before filesystem access. No
-  compiled C bridge is required. No shell commands enumerate content; native
-  `fs::std::walk_dir` enumerates a pinned directory.
-- Content, layout and output paths reject symlinks in **every** component and
-  reject `..`. Use direct paths, not symlink aliases. Missing output parents are
-  created. Missing layouts use the default; unsafe/unreadable layouts fail.
-- Only regular input files are read. Symlinks, FIFOs, embedded NUL bytes and
-  files larger than 4 MiB are reported, not silently shortened.
-- `index.md` (any ASCII case) is reserved; ASCII case-folded output-name
-  collisions are rejected before publication. Existing output
-  symlinks, directories and other special files fail preflight. Regular files
-  are replaced through exclusive same-directory temporary files, checked writes,
-  `fsync`, close and descriptor-relative rename. Existing hardlinks are replaced,
-  not truncated. Atomicity is **per file**, not an all-or-nothing site transaction;
-  partial successes remain on a later failure. No stale-output cleanup is done.
-- Limits: 256 arguments / 65,536 total argv bytes (including executable name),
-  4,096 Markdown files, 4 MiB per input/layout, 32 MiB per rendered output/index.
-  Limits fail explicitly. There is no line-count limit; empty option values and
-  quoted directory names are preserved. Input directories must remain stable
-  during enumeration; concurrent addition/removal is not a supported snapshot.
-- Layouts are trusted HTML. Place metadata only in text or quoted attributes,
-  not executable JavaScript/CSS or URL-valued attributes; use `{{content}}` only
-  in an HTML body context. The tool does not sanitize arbitrary layout HTML.
-  Keep the output directory owned by the build user, not writable by adversaries.
-- Known toolchain limitation: O0 can evaluate an allocating indexed-assignment
-  RHS twice. This repository uses local temporaries before owned-array assignment,
-  but the pinned native `fs::std::walk_dir` still contains such an assignment;
-  directory enumeration can therefore leak a duplicated filename allocation.
-  Compiler/stdlib fixes are outside this repository; this is not a claim of
-  fully leak-free O0 execution.
+- **All text is escaped.** Content, titles and dates are escaped for HTML; a
+  `<script>` in a Markdown file or a `title:` line becomes text, never markup.
+  Attribute values are always quoted and quote-escaped.
+- **Link and image targets are allowlisted.** Links allow `http`, `https`,
+  `mailto` and relative URLs; images allow `http`, `https` and relative URLs.
+  Anything else — `javascript:`, `data:`, `vbscript:`, protocol-relative
+  `//host`, entity-obfuscated or control-character-obfuscated schemes —
+  degrades to literal Markdown text and never becomes an attribute.
+- **Layouts are trusted.** A layout is HTML you wrote, so `{{content}}` is
+  inserted as markup by design. Do not put untrusted text in an executable
+  context (a script or a URL-valued attribute). Unknown placeholders stay
+  literal, and substitutions are single-pass: metadata that itself contains
+  `{{content}}` cannot introduce another substitution.
+- **Output names are bounded.** `index.md` is reserved, and names that collide
+  ignoring ASCII case are rejected before anything is written, so the result is
+  the same on a case-insensitive filesystem. A generated name is always a
+  single path component.
+- **Writes are per file, not a transaction.** A site build is not all-or-nothing:
+  pages that succeeded stay published if a later one fails. There is no
+  stale-output cleanup, so a page whose source was deleted remains until you
+  remove it.
 
-## Adopted libraries (vendored copies under src/vendor/)
+## Platform support
 
-Until the finn registry resolves bare package names, the libraries live
-as vendored copies in `src/vendor/` (imported by module name, so a
-future `[packages]` switch needs no code change):
+| Platform | Status |
+| -------- | ------ |
+| Linux x86_64 | Built and tested — CI lane, and this repository's development host. |
+| Windows x86_64 | Built and tested in CI. |
+| macOS arm64 | Built and tested in CI. |
+| Linux aarch64, macOS x86_64 | Expected to work, **not tested**. |
 
-- `src/vendor/markdown.fin` — fin-markdown v0.1.0, plus fin-ssg
-  hardening ported from the previous vendored renderer: the URL scheme
-  allowlist, quote-safe attribute emission, tag-aware emphasis passes,
-  the `TextBuffer`/`filename_url` helpers `main.fin` uses, and
-  cursor-based line iteration (no document line cap). Upstreaming
-  candidates for fin-markdown: the allowlist, tag-aware emphasis, and
-  the cursor (upstream still caps at 8192 lines).
-- `src/vendor/template.fin` — fin-template v0.1.0, used through its
-  `tpl_render` compatibility entry point (same four slots as the old
-  engine, auto-escaped metadata, `{{content|safe}}` body). Layouts may
-  also use the full engine syntax (`{{ x | filter }}`, `{% if %}`,
-  `{% for %}`); the 32 MiB rendered-output bound is enforced by
-  `main.fin`'s `render_page`, since the library itself has no cap.
-  `src/vendor/platform.fin` remains hand-rolled (native open-flag
-  selection for this tool, not a reusable library).
+The filesystem layer is written entirely against `fs::std` and `path::std`, so
+each target gets its own system calls from the standard library: POSIX
+`open`/`rename`/`mkdir` on Linux and macOS, the UCRT plus Win32 directory calls
+on Windows. No compiled C bridge is required, and no path is built by joining
+strings with `/`: `normalize` applies the target's own separator rules and
+knows that `C:\` is a drive rather than a directory name.
 
-Both are imported by name (`import { md_to_html } from markdown::fin`) and
-compile through the native backend. Returned renderer strings are explicitly
-owned and released after each page.
+One constant is per target rather than from the standard library: the
+`O_NONBLOCK` used to refuse a FIFO without blocking on it. It is 0x800 on
+Linux, 0x4 on macOS and a different `_open` flag set on Windows, and getting
+it wrong does not fail loudly — the open simply blocks. `nonblocking_read_flags`
+in `src/platform.fin` states each value once.
 
-## Tests & CI
+Platform notes:
+
+- The published Linux *glibc* artifact does not start without
+  `libLLVM.so.22.1`, and the macOS artifact needs Homebrew's `llvm@22` keg.
+  Both are dynamically linked against LLVM; only the Linux musl archive is
+  static. Use it, as above.
+- `finc` links every program it builds against `-lLLVM-22` even when that
+  program uses no LLVM symbol, so building on a machine with no LLVM
+  development library needs `FIN_LDFLAGS` to replace the default library
+  list. CI does this; the commands above assume a machine that has LLVM.
+- On Windows, renaming over an existing file is not atomic, so `write_atomic`
+  removes the destination first. The window is small but real; POSIX
+  platforms rename over it in one step.
+
+## Testing
 
 ```sh
-python3 -I tests/smoke.py --finc /path/to/finc --fin-libs /path/to/lib/std
-python3 -I tests/smoke.py --finc /path/to/finc --fin-libs /path/to/lib/std --opt=-O2
+python3 -I tests/e2e.py --finc finc          # end-to-end, the real suite
+finc -I src tests/markdown_test.fin -o t && ./t   # library-level checks
 ```
 
-The Python entry point is the portable one; `tests/smoke.sh` is a thin wrapper
-around it for the POSIX shell. Both build the generator, check the
-architecture-specific open flags, build the example site, and run the
-security, CLI, filesystem and limits regressions.
+`tests/e2e.py` builds the generator, then builds sites and asserts on the
+**published files**: that each expected page exists, that the documented
+Markdown constructs appear as the documented HTML, that content and metadata
+are escaped, that dangerous URLs never become attributes, that two builds are
+byte-identical, that a nested output directory is created and a `..` path is
+refused, that over-limit and special inputs are reported rather than truncated,
+and that a failed write leaves the previous page in place. It parses every page
+with Python's HTML parser, so malformed output fails the suite.
 
-The regression benchmark renders **20,001 lines** (10,000 `line`/blank pairs
-plus a tail sentinel), preserving the tail. Observed wall times on the test host
-were approximately 0.011 s at O0 and 0.007 s at O2; these are illustrative local
-measurements, not portable performance thresholds.
+CI runs that on Linux, Windows and macOS, using the pinned compiler release;
+the version is one file, [`FINC_VERSION`](FINC_VERSION), and the download is
+refused unless its SHA-256 matches the published index.
 
-`.github/workflows/ci.yml` installs the Fin toolchain, runs the frontend
-check, builds the binary, and runs the smoke test on every push/PR.
+## Verification
+
+What was actually run, on Linux x86_64:
+
+- `tests/e2e.py` and `tests/markdown_test.fin` pass with `finc` 1.0.1 and with
+  the pinned `finc` 1.0.0 release (musl artifact). The repeat-build check
+  compares every published file byte-for-byte.
+- `finn build` and `finn test` pass with `finn` 1.0.1 against this
+  `finn.toml`; `finn do test` runs the end-to-end suite too.
+- CI runs the same suite on Linux, Windows and macOS against `finc` 1.0.0
+  from the published release, and all three lanes pass. Each lane compiled
+  the generator, ran the library tests, built the example site and asserted on
+  the published files.
+- On this machine there is no Windows or macOS host, so the Windows and macOS
+  **behaviour** is proven by CI only. Their source branches were type-checked
+  by forcing `FIN_TARGET_WINDOWS` and `FIN_TARGET_DARWIN`.
+
+`finc` 1.0.1 defect this repository works around, reported upstream: when two
+imported modules export the same function name, the name binds to whichever
+import was seen first, silently and irrespective of arity. `path::std.join`
+collides this way with the `strings::std.join` that joins a Collection (pulled
+in by `fs::std`), and the resulting program calls the Collection method with two
+strings and crashes. `src/platform.fin` therefore normalises
+`parent + "/" + child` instead of calling `join`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). The vendored renderer and template engine are
+also MIT (their upstream repositories are part of the same Fin ecosystem).

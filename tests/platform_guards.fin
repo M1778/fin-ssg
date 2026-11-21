@@ -1,0 +1,114 @@
+// =============================================================================
+// Fin Programming Language
+//
+// Made with ❤️ for someone special.
+//
+// This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+// Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+// Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+// “Love is the reason this project exists”
+// -----------------------------------------------------------------------------
+// Author: M1778
+// Repository: https://github.com/M1778/fin-ssg
+// Profile: https://github.com/M1778M/
+// -----------------------------------------------------------------------------
+// Copyright (C) 2027 M1778
+//
+// This file is part of fin-ssg, a project for the Fin Programming Language.
+//
+// Licensed under the MIT License. See LICENSE in the repository root.
+//
+// SPDX-License-Identifier: MIT
+// =============================================================================
+
+// Tests for the path guards in src/platform.fin.
+//
+// These replaced tests/platform.fin, which pinned the `linux_open_flags` table. That table
+// no longer exists -- the open flags are now selected per target inside platform.fin with
+// `#c_ifdef`, so there are no numbers to assert -- but the thing the table existed for was
+// real: an open that follows a symlink, or a generated name that escapes the output
+// directory, is a security defect and not a wrong value.
+//
+// So the assertions moved from "these numbers are right" to "these inputs are refused",
+// which is the property a caller depends on and the property a refactor can break silently.
+//
+// Run: finc -I src tests/platform_guards.fin -o test_platform_guards && ./test_platform_guards
+
+import { has_parent_step, component_ok, open_directory, close_directory, nonblocking_read_flags, Dir } from platform::fin;
+import { assert_true } from testing::std;
+import { equals } from strings::std;
+
+fun main() <noret> {
+    // ---- has_parent_step: a `..` component anywhere refuses, and `..` inside a name does not
+    assert_true(has_parent_step(".."), "'..' alone is a parent step");
+    assert_true(has_parent_step("a/.."), "'a/..' is a parent step");
+    assert_true(has_parent_step("a/../b"), "an interior '..' is a parent step");
+    assert_true(has_parent_step("../a"), "a leading '..' is a parent step");
+    // `\\` is a separator on Windows and a legal filename character on POSIX, so this one
+    // assertion is per target rather than shared. Asserting it unconditionally would have
+    // been a test of the platform I happened to run it on -- which is how a POSIX-only bug
+    // ships to Windows, and the reverse.
+    #c_ifdef FIN_TARGET_WINDOWS
+    assert_true(has_parent_step("a\\.."), "a backslash-separated '..' is a parent step on Windows");
+    assert_true(has_parent_step("a\\..\\b"), "an interior backslash '..' is a parent step");
+    #c_else
+    assert_true(!has_parent_step("a\\.."), "on POSIX a backslash is a name character, not a separator");
+    #c_endif
+
+    // Not parent steps: a name that merely contains dots.
+    assert_true(!has_parent_step("."), "'.' is not a parent step");
+    assert_true(!has_parent_step("a..b"), "'a..b' is a name, not a step");
+    assert_true(!has_parent_step("..."), "'...' is a name, not a step");
+    assert_true(!has_parent_step("a/b"), "an ordinary relative path is fine");
+    assert_true(!has_parent_step(""), "the empty path has no steps");
+
+    // ---- component_ok: the guard that keeps a generated name inside the output directory
+    assert_true(component_ok("index.html"), "an ordinary file name is usable");
+    assert_true(component_ok("a.b.md"), "dots inside a name are fine");
+    assert_true(component_ok("..."), "'...' is a legal name even though it looks odd");
+
+    assert_true(!component_ok("."), "'.' names a directory, not a file");
+    assert_true(!component_ok(".."), "'..' escapes the directory");
+    assert_true(!component_ok(""), "the empty name appends nothing");
+    assert_true(!component_ok("a/b"), "'/' would create or reach another directory");
+    #c_ifdef FIN_TARGET_WINDOWS
+    assert_true(!component_ok("a\\b"), "'\\' would reach another directory on Windows");
+    #c_else
+    assert_true(component_ok("a\\b"), "on POSIX '\\' is an ordinary name character");
+    #c_endif
+    // An interior NUL CANNOT be detected from a `string`: the value is NUL-terminated and
+    // carries no length, so `len` stops at the NUL and `a` NUL `b` is indistinguishable from
+    // `a`. Recorded here as a fact about the input type rather than asserted as a guard,
+    // because the guard would be a lie -- which is what the comment in platform.fin said
+    // until this test was written.
+    assert_true(component_ok("a\u0000b"), "an interior NUL is invisible to a string, not refused");
+
+    // ---- open_directory: `..` and NUL refuse, and refuse without creating anything
+    let escaped <Dir> = open_directory("..", false);
+    assert_true(!escaped.ok, "'..' must not open");
+    close_directory(&escaped);
+
+    let interior <Dir> = open_directory("a/../b", false);
+    assert_true(!interior.ok, "an interior '..' must not open");
+    close_directory(&interior);
+
+    let empty <Dir> = open_directory("", false);
+    assert_true(!empty.ok, "the empty path must not open");
+    close_directory(&empty);
+
+    // A path that does not exist is refused when `create` is false, rather than reported as
+    // an empty directory -- the difference between "nothing there" and "I opened nothing".
+    let missing <Dir> = open_directory("/nonexistent/fin-ssg-guard-check", false);
+    assert_true(!missing.ok, "a non-existent directory must not open without create");
+    close_directory(&missing);
+
+    // ---- nonblocking_read_flags: non-zero, and different from a plain read
+    // The exact value is per target (0x800 on Linux, 0x4 on Darwin) and is deliberately not
+    // asserted here: the number is not the contract, the behaviour is. What is worth pinning
+    // is that the flag exists at all, because zero would mean a FIFO read blocks forever,
+    // which is the hang the function exists to prevent.
+    let flags <int> = nonblocking_read_flags();
+    assert_true(flags != 0, "the non-blocking flag must be set, or a FIFO read hangs");
+
+    printf("platform guards: parent steps, components and open refusal passed\n");
+}
