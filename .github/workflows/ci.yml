@@ -22,13 +22,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `ldflags` is the value FIN_LDFLAGS takes, and the values differ
+        # because finc puts -lLLVM-22 on every POSIX link line and a runner has
+        # no LLVM development library; FIN_LDFLAGS replaces that whole list.
+        # It is a matrix value rather than an expression because an empty
+        # string is falsy in a GitHub expression, so `A && '' || B` yields B.
         include:
           - name: linux-x86_64
             os: ubuntu-24.04
+            ldflags: "-lm"
           - name: macos-arm64
             os: macos-14
+            ldflags: "-lm"
           - name: windows-x86_64
             os: windows-2022
+            ldflags: "-llegacy_stdio_definitions"
 
     steps:
       - uses: actions/checkout@v4
@@ -81,13 +89,13 @@ jobs:
       - name: Build the generator
         shell: bash
         env:
-          FIN_LDFLAGS: ${{ runner.os == 'Windows' && '' || '-lm' }}
+          FIN_LDFLAGS: ${{ matrix.ldflags }}
         run: finc -I src src/main.fin -o fin-ssg${{ runner.os == 'Windows' && '.exe' || '' }}
 
       - name: Library tests
         shell: bash
         env:
-          FIN_LDFLAGS: ${{ runner.os == 'Windows' && '' || '-lm' }}
+          FIN_LDFLAGS: ${{ matrix.ldflags }}
         run: |
           finc -I src tests/markdown_test.fin -o markdown-test${{ runner.os == 'Windows' && '.exe' || '' }}
           ./markdown-test${{ runner.os == 'Windows' && '.exe' || '' }}
@@ -97,7 +105,7 @@ jobs:
       - name: End-to-end site tests
         shell: bash
         env:
-          FIN_LDFLAGS: ${{ runner.os == 'Windows' && '' || '-lm' }}
+          FIN_LDFLAGS: ${{ matrix.ldflags }}
         run: python3 -I tests/e2e.py --finc finc
 
       # The manifest is part of the product: prove the real package manager
@@ -105,8 +113,11 @@ jobs:
       - name: finn can consume the manifest
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          FIN_LDFLAGS: ${{ matrix.ldflags }}
         run: |
           cargo install finn --git https://github.com/M1778/finn
-          FIN_COMPILER_PATH="$PWD/.finc/bin/finc" finn build
+          export FIN_COMPILER_PATH="$PWD/.finc/bin/finc"
+          finn build
           ./out/fin-ssg --help > /dev/null
-          FIN_COMPILER_PATH="$PWD/.finc/bin/finc" finn test
+          finn test
