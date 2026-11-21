@@ -1,0 +1,260 @@
+// =============================================================================
+// Fin Programming Language
+//
+// Made with ❤️ for someone special.
+//
+// This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+// Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+// Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+// “Love is the reason this project exists”
+// -----------------------------------------------------------------------------
+// Author: M1778
+// Repository: https://github.com/M1778/fin-ssg
+// Profile: https://github.com/M1778M/
+// -----------------------------------------------------------------------------
+// Copyright (C) 2027 M1778
+//
+// This file is part of fin-ssg, a project for the Fin Programming Language.
+//
+// Licensed under the MIT License. See LICENSE in the repository root.
+//
+// SPDX-License-Identifier: MIT
+// =============================================================================
+
+// The filesystem operations the generator needs, named once and implemented
+// with `fs::std` and `path::std`.
+//
+// Why the standard library rather than raw system calls: the *at syscall
+// family, the open-flag numbers and the stat record layout differ per target,
+// and a wrong guess is a silent security or memory bug. `fs::std` already
+// spells each target correctly (POSIX libc calls, UCRT plus Win32 directory
+// APIs on Windows) and `path::std` knows that a separator is `/` on POSIX but
+// also `\` on Windows, and that a drive letter is not a directory name. This
+// module supplies only what the library does not: a pinned directory, the
+// bounded read, and replacing a file through a temporary name.
+//
+// What this layer does NOT do, and the caller must not assume:
+//   * it follows symlinks. A content entry that points at another file is read.
+//     A symlinked output name is replaced by a regular file, never written
+//     through, so it cannot be used to reach outside the output directory.
+//   * it does not fsync. A page that was renamed into place survives a failed
+//     write, but not necessarily a power loss.
+// Only `Dir.path` is stored; there is no descriptor to leak.
+import { is_dir, file_size, read_to_string, write_string, mkdir_p, rename_path, remove_file, free_file_content } from fs::std;
+import { normalize, free_path } from path::std;
+import { len, to_chars, concat, free_str, clone } from strings::std;
+
+namespace fin {
+
+// `parent` plus `child`, normalised for the target.
+//
+// `path::std.join` cannot be used here: `fs::std` imports `strings::std`, which
+// exports a different `join` (a Collection of strings), and in finc 1.0.1 the
+// analyzer binds the name to whichever module it reached first. Calling the
+// path one then runs the Collection version with two strings and crashes.
+// `normalize` has no same-named counterpart and is a real path operation.
+fun path_join(parent: string, child: string) <string> {
+    return normalize(concat(parent, concat("/", child)));
+}
+
+// A directory named by its path. `ok` is false when the path is not (and could
+// not be made into) a directory the caller may use.
+pub struct Dir { path <string>, ok <bool> }
+
+fun is_separator(c: char) <bool> {
+    if (c == '/') { return true; }
+    #c_ifdef FIN_TARGET_WINDOWS
+    if (c == '\\') { return true; }
+    #c_endif
+    return false;
+}
+
+// Whether a NUL byte appears in `path`. A `string` carries no length, so a
+// path whose text was truncated at a NUL would silently name a different file.
+fun has_nul(path: string) <bool> {
+    let chars <[char]> = to_chars(path);
+    let total <int> = chars.length - 1;
+    let found <bool> = false;
+    for (let i <int> = 0; !found && i < total; i++) {
+        if (chars[i] == cast<char>(0)) { found = true; }
+    }
+    delete chars;
+    return found;
+}
+
+// Whether `path` contains a `..` component. Such a path is refused outright:
+// a name that walks up is not a name the caller gave us, and on Windows the
+// separator may be either character.
+pub fun has_parent_step(path: string) <bool> {
+    let chars <[char]> = to_chars(path);
+    let total <int> = chars.length - 1;
+    let found <bool> = false;
+    let start <int> = 0;
+    let i <int> = 0;
+    while (i <= total && !found) {
+        if (i == total || is_separator(chars[i])) {
+            if (i - start == 2 && chars[start] == '.' && chars[start + 1] == '.') { found = true; }
+            start = i + 1;
+        }
+        i++;
+    }
+    delete chars;
+    return found;
+}
+
+// Whether one path component can be appended to a directory. This is the
+// guard that keeps a generated output name inside the output directory on
+// every platform: `/`, `\` and NUL never appear in a name, and neither `.`
+// nor `..` names anything.
+pub fun component_ok(name: string) <bool> {
+    if (name == null) { return false; }
+    let n <int> = len(name);
+    if (n == 0) { return false; }
+    if (name == "." || name == "..") { return false; }
+    let chars <[char]> = to_chars(name);
+    let ok <bool> = true;
+    for (let i <int> = 0; ok && i < n; i++) {
+        if (is_separator(chars[i]) || chars[i] == cast<char>(0)) { ok = false; }
+    }
+    delete chars;
+    return ok;
+}
+
+// Opens (and with `create`, makes) the directory. A relative path is resolved
+// against the process working directory, which is what the CLI arguments mean.
+// An empty path, an interior NUL, or a `..` component is refused: a `..` names
+// a directory the caller did not ask for, and on Windows `.` and `..` are
+// spelled with either separator.
+pub fun open_directory(path: string, create: bool) <Dir> {
+    let dir <Dir> = Dir{path: clone(path), ok: false};
+    if (len(path) == 0 || has_parent_step(path) || has_nul(path)) {
+        free_str(dir.path);
+        dir.path = clone("");
+        return dir;
+    }
+    if (is_dir(path)) { dir.ok = true; return dir; }
+    if (!create) { return dir; }
+    if (!mkdir_p(path)) { return dir; }
+    dir.ok = is_dir(path);
+    return dir;
+}
+
+pub fun close_directory(dir: &Dir) <noret> {
+    free_str(dir.path);
+    dir.path = clone("");
+    dir.ok = false;
+}
+
+// Whether `path` can be read as a seekable file, without blocking: 1 yes,
+// 0 no such name, -1 it exists but is not a readable regular file.
+//
+// This is the FIFO guard. Opening a FIFO for reading blocks until a writer
+// appears, so `fs::file_size`/`read_to_string` on one would hang the build
+// rather than report it. O_NONBLOCK makes the open return immediately, and a
+// seek to the end succeeds only on something with a position, which a FIFO has
+// not. A directory answers -1 too and is refused here rather than in the walk.
+#c_ifdef FIN_TARGET_WINDOWS
+#[llvm_name="_open"]
+@define probe_open(path: string, flags: int, mode: int) <int>;
+#[llvm_name="_close"]
+@define probe_close(fd: int) <int>;
+#[llvm_name="_lseeki64"]
+@define probe_lseek(fd: int, offset: long, whence: int) <long>;
+#c_else
+#[llvm_name="open"]
+@define probe_open(path: string, flags: int, mode: int) <int>;
+#[llvm_name="close"]
+@define probe_close(fd: int) <int>;
+#[llvm_name="lseek"]
+@define probe_lseek(fd: int, offset: long, whence: int) <long>;
+#c_endif
+
+pub fun file_probe(path: string) <int> {
+    let flags <int> = 2048;
+    #c_ifdef FIN_TARGET_WINDOWS
+    // _O_RDONLY is 0, _O_BINARY is 0x8000, _O_NOINHERIT is 0x80. A device
+    // rejects the seek, which is the answer wanted.
+    flags = 32768 + 128;
+    #c_endif
+    let fd <int> = probe_open(path, flags, 0);
+    if (fd < 0) { return 0; }
+    let end <long> = probe_lseek(fd, cast<long>(0), 2);
+    probe_close(fd);
+    if (end < cast<long>(0)) { return -1; }
+    return 1;
+}
+
+// What a name inside the directory is: 1 a readable regular file, 0 not there,
+// -1 something else (a directory, a FIFO, a socket, a device). Symlinks are
+// followed -- see the module comment.
+pub fun name_kind(dir: Dir, name: string) <int> {
+    if (!dir.ok || !component_ok(name)) { return -1; }
+    let full <string> = path_join(dir.path, name);
+    let kind <int> = file_probe(full);
+    if (kind == 1 && is_dir(full)) { kind = -1; }
+    free_path(full);
+    return kind;
+}
+
+// The process id, for a temporary name that two concurrent builds of the same
+// site cannot share. `getpid` is POSIX; Windows spells it `_getpid`.
+#c_ifdef FIN_TARGET_WINDOWS
+#[llvm_name="_getpid"]
+@define c_process_id() <int>;
+#c_else
+#[llvm_name="getpid"]
+@define c_process_id() <int>;
+#c_endif
+
+fun process_id() <int> {
+    return c_process_id();
+}
+
+// Reads a name as text, refusing anything over `limit` bytes and anything
+// containing a NUL: a Fin `string` is NUL-terminated, so a file that holds one
+// cannot be represented, and silently shortening it would corrupt a page.
+// A `string` carries no length, so the NUL is caught by comparing the whole
+// file size with the length of what came back: a short answer means the bytes
+// past the first NUL were dropped.
+pub fun? read_text(dir: Dir, name: string, limit: int) <string> {
+    if (name_kind(dir, name) != 1) { return null; }
+    let full <string> = path_join(dir.path, name);
+    let size <long> = file_size(full);
+    if (size < cast<long>(0) || size > cast<long>(limit)) { free_path(full); return null; }
+    let text? <string> = read_to_string(full);
+    free_path(full);
+    if (text == null) { return null; }
+    if (cast<long>(len(text?)) != size) { free_file_content(text?); return null; }
+    return text?;
+}
+
+// Publishes `text` as `dest`: written under a temporary name in the same
+// directory, then renamed over the destination, so a reader never sees a
+// half-written page and a failed write leaves the previous page in place.
+//
+// The size check is not redundant: `fs::std::write_string` reports success even
+// when the filesystem wrote fewer bytes than it was given (a full disk, a
+// quota, RLIMIT_FSIZE), because it ignores `fclose`. Comparing the written size
+// against the length being published is what turns that into a refused page
+// instead of a silently truncated one.
+pub fun write_atomic(dir: Dir, dest: string, text: string) <bool> {
+    if (!dir.ok || !component_ok(dest) || text == null) { return false; }
+    let expected <long> = cast<long>(len(text));
+    // The pid keeps two builds writing into one directory from sharing a
+    // temporary name and renaming each other's bytes into place.
+    let temp <string> = format!(".{}.{}.fin-ssg.tmp", dest, process_id());
+    let temp_path <string> = path_join(dir.path, temp);
+    let dest_path <string> = path_join(dir.path, dest);
+    let ok <bool> = write_string(temp_path, text);
+    if (ok && file_size(temp_path) != expected) { ok = false; }
+    if (ok && !rename_path(temp_path, dest_path)) {
+        remove_file(dest_path);
+        ok = rename_path(temp_path, dest_path);
+    }
+    if (ok && file_size(dest_path) != expected) { ok = false; }
+    if (!ok) { remove_file(temp_path); }
+    free_path(temp_path); free_path(dest_path); free_str(temp);
+    return ok;
+}
+
+}

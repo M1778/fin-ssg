@@ -1,6 +1,29 @@
-// ADOPTED 2026-10-23: fin-markdown v0.1.0 (M1778/fin-markdown, builder-3 copy).
-// Replaces the vendored Markdown subset. Deltas vs upstream fin-markdown,
-// all required by fin-ssg's security suite (tests/security.py):
+// =============================================================================
+// Fin Programming Language
+//
+// Made with ❤️ for someone special.
+//
+// This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+// Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+// Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+// “Love is the reason this project exists”
+// -----------------------------------------------------------------------------
+// Author: M1778
+// Repository: https://github.com/M1778/fin-ssg
+// Profile: https://github.com/M1778M/
+// -----------------------------------------------------------------------------
+// Copyright (C) 2027 M1778
+//
+// This file is part of fin-ssg, a project for the Fin Programming Language.
+//
+// Licensed under the MIT License. See LICENSE in the repository root.
+//
+// SPDX-License-Identifier: MIT
+// =============================================================================
+
+// fin-markdown v0.1.0 (M1778/fin-markdown), adapted during adoption.
+// Deltas vs upstream, each required by fin-ssg's rendering contract
+// (tests/e2e.py asserts all of them):
 //   * URL scheme allowlist (http/https, +mailto for links only) on
 //     inline, autolink and reference-link URLs; unsafe URLs degrade to
 //     literal text instead of becoming links (old vendored safe_url).
@@ -12,14 +35,12 @@
 //   * TextBuffer helpers + md_escape_into + filename_url ported from the
 //     old vendored file (main.fin imports them from markdown::fin).
 //   * md_to_html stays non-nullable; the 32 MiB published-output bound
-//     lives in main.fin's render_page (as after the fin-template swap).
-// Upstreaming note: the allowlist + tag-aware emphasis should move into
+//     lives in main.fin's render_page.
+// Upstreaming note: the allowlist and tag-aware emphasis should move into
 // fin-markdown itself so the next upgrade is a clean swap.
 // fin-markdown — Markdown → HTML for Fin (v0.1.0).
 //
-// Drop-in replacement for the Markdown subset vendored in fin-ssg's
-// src/vendor/markdown.fin (marked there for replacement). Same public API
-// and same import spelling:
+// Public API, imported as `markdown::fin`:
 //   import { md_to_html, md_inline, md_escape_html } from markdown::fin;
 //
 // Block subset:

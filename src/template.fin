@@ -1,3 +1,26 @@
+// =============================================================================
+// Fin Programming Language
+//
+// Made with ❤️ for someone special.
+//
+// This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+// Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+// Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+// “Love is the reason this project exists”
+// -----------------------------------------------------------------------------
+// Author: M1778
+// Repository: https://github.com/M1778/fin-ssg
+// Profile: https://github.com/M1778M/
+// -----------------------------------------------------------------------------
+// Copyright (C) 2027 M1778
+//
+// This file is part of fin-ssg, a project for the Fin Programming Language.
+//
+// Licensed under the MIT License. See LICENSE in the repository root.
+//
+// SPDX-License-Identifier: MIT
+// =============================================================================
+
 // ADOPTED 2026-10-23: fin-template v0.1.0 (M1778/fin-template, builder-2 copy).
 // Replaces the vendored single-pass {{key}} engine. tpl_render signature
 // unchanged; deltas vs the old engine: (1) returns "" (not null) on render
@@ -22,7 +45,7 @@
 //   {% extends "layout.html" %}
 //   {# comment #}               removed from output
 //
-// Design decisions (see README.md):
+// Design decisions:
 // - Context is a flat key/value store (strings + string lists), the same
 //   shape fin-validate proved on finc 0.4.0. No object model: dotted keys
 //   are set with ctx_set(ctx, "user.name", ...) and looked up verbatim.
@@ -1007,8 +1030,7 @@ pub fun template_render_file(path: string, ctx: &Context) <RenderResult> {
     return template_render(&tr.template, ctx);
 }
 
-// Drop-in for the minimal {{key}} engine fin-ssg vendored
-// (apps/fin-ssg/src/vendor/template.fin). Same four slots; the content slot
+// `tpl_render`, the four-slot entry point fin-ssg calls. The content slot
 // is rendered unescaped (it carries pre-rendered HTML), while site_title,
 // title and date are auto-escaped (fin-template's default — callers that
 // pre-escaped those should stop doing so).
