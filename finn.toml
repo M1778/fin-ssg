@@ -1,18 +1,17 @@
-# finn.toml — REAL format per github.com/M1778/finn (README, 2026-10-19).
-# Layout: finn.toml, src/main.fin, src/vendor/*.fin, tests/, .finn/packages/.
+# finn.toml — the manifest the real package manager consumes.
+#
+# `finn` resolves imports as `-I src` plus the standard library, so every
+# module this project imports lives directly in `src/`. An entrypoint is a file
+# under `src/`; `main.fin` builds the CLI.
 [project]
 name = "fin-ssg"
-version = "0.1.0"
+version = "0.2.0"
 envpath = ".finn"
 entrypoint = "main.fin"
 
-# fin-markdown + fin-template are adopted as vendored copies under
-# src/vendor/ (fin-markdown v0.1.0 + fin-ssg hardening; fin-template
-# v0.1.0 via tpl_render). No [packages] until the finn registry resolves
-# bare names; the import spellings already match, so that switch needs
-# no code change.
+[packages]
 
 [scripts]
-check = "finc -I src/vendor src/main.fin"
-build = "finc -I src/vendor src/main.fin -o fin-ssg"
-smoke = "sh tests/smoke.sh"
+check = "finc -I src src/main.fin"
+build = "finc -I src src/main.fin -o fin-ssg"
+test = "finc -I src tests/markdown_test.fin -o build-test && ./build-test && python3 -I tests/e2e.py --finc finc"
