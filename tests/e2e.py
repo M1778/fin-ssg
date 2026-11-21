@@ -476,9 +476,10 @@ def test_limits(binary, work):
     write(content / "good.md", "# good\n")
     out = work / "limit-out"
     result = site(binary, content, out)
-    check(result.returncode == 2)          # some pages failed, the rest built
-    check(not (out / "big.html").exists())
-    check(not (out / "nul.html").exists())
+    check(result.returncode == 2,
+          f"exit {result.returncode}; stdout={result.stdout.strip()!r} stderr={result.stderr.strip()!r}")
+    check(not (out / "big.html").exists(), "no page for the over-size input")
+    check(not (out / "nul.html").exists(), "no page for the NUL input")
     check((out / "good.html").is_file())
     check((out / "index.html").is_file())
     index = (out / "index.html").read_text(encoding="utf-8")
