@@ -47,8 +47,13 @@ pub fun error_already_exists() <int> { return 17; }
 #[llvm_name="GetLastError"]
 @define platform_last_error() <uint>;
 #c_else
+#c_ifdef FIN_TARGET_DARWIN
+#[llvm_name="__error"]
+@define platform_errno() <&int>;
+#c_else
 #[llvm_name="__errno_location"]
 @define platform_errno() <&int>;
+#c_endif
 #c_endif
 
 // The Linux open flags, by architecture. O_DIRECTORY and O_NOFOLLOW have
@@ -198,6 +203,19 @@ pub fun name_kind(dir: DirHandle, name: string) <int> {
     return 1;
 }
 #c_else
+// `st_mode` out of a `struct stat`, which has a different layout on every libc: Darwin puts
+// the 16-bit `mode_t` at offset 4, Linux puts the 32-bit one at offset 24. The offsets used
+// to be inlined as `info[24]`/`info[25]`, which reads the wrong bytes on every platform that
+// is not Linux x86_64 and answers the wrong kind for every name -- a wrong-value bug, and a
+// directory walk that quietly stops early looks like an empty site rather than a broken one.
+priv fun platform_stat_mode(info: [char]) <int> {
+    #c_ifdef FIN_TARGET_DARWIN
+    return cast<int>(info[4]) + (cast<int>(info[5]) & 255) * 256;
+    #c_else
+    return cast<int>(info[24]) + (cast<int>(info[25]) & 255) * 256;
+    #c_endif
+}
+
 // What a name inside a directory is, without following it: 1 a regular file,
 // 0 not there, -1 something else. AT_SYMLINK_NOFOLLOW reports a symlink
 // rather than the file it points at, which is the whole point: a symlink is
@@ -211,7 +229,7 @@ pub fun name_kind(dir: DirHandle, name: string) <int> {
         if (missing) { return 0; }
         return -1;
     }
-    let mode <int> = (cast<int>(info[24]) & 255) + (cast<int>(info[25]) & 255) * 256;
+    let mode <int> = platform_stat_mode(info);
     delete info;
     // S_IFMT is 0170000 and S_IFLNK is 0120000; a regular file is 0100000.
     let kind <int> = mode & 61440;
@@ -379,7 +397,7 @@ pub fun is_regular_file(handle: FileHandle) <bool> {
     // AT_EMPTY_PATH asks about the descriptor itself rather than a name.
     let status <int> = platform_fstatat(handle, "", &info[0], 4096);
     if (status < 0) { delete info; return false; }
-    let mode <int> = (cast<int>(info[24]) & 255) + (cast<int>(info[25]) & 255) * 256;
+    let mode <int> = platform_stat_mode(info);
     delete info;
     if ((mode & 61440) == 32768) { return true; }
     return false;
