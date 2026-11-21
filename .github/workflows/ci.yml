@@ -115,6 +115,14 @@ jobs:
 
       # The suite builds its own copy of the generator and asserts on the
       # published site, so this step is the one that proves the tool works.
+      - name: Path guards
+        shell: bash
+        env:
+          FIN_LDFLAGS: ${{ matrix.ldflags }}
+        run: |
+          finc -I src tests/platform_guards.fin -o "$RUNNER_TEMP/platform_guards"
+          "$RUNNER_TEMP/platform_guards"
+
       - name: End-to-end site tests
         shell: bash
         env:
