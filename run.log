@@ -1,0 +1,7 @@
+== frontend check ==
+== codegen + link -O0 ==
+== open-flag mapping ==
+== build the example site ==
+== default layout ==
+== security, CLI, filesystem and limits regressions ==
+SMOKE OK

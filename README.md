@@ -14,6 +14,16 @@ language" demo — think a tiny Hugo.
 > The filesystem layer now selects its calls for the native target, so macOS and
 > Windows are compiled from the same source as Linux. What is verified natively
 > is stated per platform below; the Linux behaviour is unchanged.
+>
+> **Verified natively on Linux only.** This repository's CI has one lane, and it is
+> Linux. The macOS and Windows code paths exist and compile, but no lane has executed them,
+> so "compiles from the same source" is not a statement that they run correctly.
+>
+> One of them does not, by design: `detect_open_flags` in `src/vendor/platform.fin` reads
+> `uname` and returns `ok: false` for any system that is not Linux, and the generator then
+> reports that it requires Linux x86_64 or aarch64. On macOS that is a refusal, not a
+> silent wrong answer, and it should be read as "not supported yet" rather than as a bug.
+> Windows uses its own flag constants and does not take that path.
 
 ## What it does
 

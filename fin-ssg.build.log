@@ -1,0 +1,316 @@
+error: module not found: markdown
+   = help: searched: src, /home/M1778/Fin/lib/std, .
+error: module not found: template
+   = help: searched: src, /home/M1778/Fin/lib/std, .
+error: module not found: platform
+   = help: searched: src, /home/M1778/Fin/lib/std, .
+error: Failed to load module 'markdown'
+   --> src/main.fin:6:1
+   |
+ 6 | import { TextBuffer, text_buffer, text_char, text_append, text_finish, md_to_html, md_escape_into, filename_url } from markdown::fin;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Failed to load module 'template'
+   --> src/main.fin:7:1
+   |
+ 7 | import { tpl_render } from template::fin;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Failed to load module 'platform'
+   --> src/main.fin:8:1
+   |
+ 8 | import { OpenFlags, DirHandle, FileHandle, detect_open_flags, platform_open_directory, open_in_directory, is_regular_file, name_kind, file_read, file_write, file_flush, file_close, rename_in_directory, unlink_in_directory, directory_flush, directory_path, platform_pid, platform_error_is_missing, platform_error_is_exists } from platform::fin;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined type 'DirHandle'
+   --> src/main.fin:46:23
+    |
+ 46 | fun regular_file(dir: DirHandle, name: string, abi: OpenFlags) <int> {
+    |                       ^^^^^^^^^ here
+error: Undefined type 'OpenFlags'
+   --> src/main.fin:46:53
+    |
+ 46 | fun regular_file(dir: DirHandle, name: string, abi: OpenFlags) <int> {
+    |                                                     ^^^^^^^^^ here
+error: Undefined function or type 'name_kind'
+   --> src/main.fin:47:12
+    |
+ 47 |     return name_kind(dir, name);
+    |            ^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined type 'DirHandle'
+   --> src/main.fin:50:21
+    |
+ 50 | fun? read_file(dir: DirHandle, name: string, abi: OpenFlags) <string> {
+    |                     ^^^^^^^^^ here
+error: Undefined type 'OpenFlags'
+   --> src/main.fin:50:51
+    |
+ 50 | fun? read_file(dir: DirHandle, name: string, abi: OpenFlags) <string> {
+    |                                                   ^^^^^^^^^ here
+error: Undefined type 'FileHandle'
+   --> src/main.fin:52:15
+    |
+ 52 |     let file <FileHandle> = open_in_directory(dir, name, false, abi);
+    |               ^^^^^^^^^^ here
+error: Undefined function or type 'open_in_directory'
+   --> src/main.fin:52:29
+    |
+ 52 |     let file <FileHandle> = open_in_directory(dir, name, false, abi);
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'is_regular_file'
+   --> src/main.fin:54:10
+    |
+ 54 |     if (!is_regular_file(file)) { file_close(file); return null; }
+    |          ^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_close'
+   --> src/main.fin:54:35
+    |
+ 54 |     if (!is_regular_file(file)) { file_close(file); return null; }
+    |                                   ^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_read'
+   --> src/main.fin:59:25
+    |
+ 59 |         let got <int> = file_read(file, &buf[used], MAX_INPUT + 1 - used);
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_close'
+   --> src/main.fin:64:10
+    |
+ 64 |     if (!file_close(file)) { ok = false; }
+    |          ^^^^^^^^^^^^^^^^ here
+error: Undefined type 'DirHandle'
+   --> src/main.fin:75:23
+    |
+ 75 | fun atomic_write(dir: DirHandle, dest: string, text: string, abi: OpenFlags) <bool> {
+    |                       ^^^^^^^^^ here
+error: Undefined type 'OpenFlags'
+   --> src/main.fin:75:67
+    |
+ 75 | fun atomic_write(dir: DirHandle, dest: string, text: string, abi: OpenFlags) <bool> {
+    |                                                                   ^^^^^^^^^ here
+error: Undefined type 'FileHandle'
+   --> src/main.fin:79:13
+    |
+ 79 |     let fd <FileHandle> = -1;
+    |             ^^^^^^^^^^ here
+error: Undefined function or type 'platform_pid'
+   --> src/main.fin:81:46
+    |
+ 81 |         temp = format!(".fin-ssg-{}-{}.tmp", platform_pid(), attempt);
+    |                                              ^^^^^^^^^^^^^^ here
+error: Undefined function or type 'open_in_directory'
+   --> src/main.fin:83:14
+    |
+ 83 |         fd = open_in_directory(dir, temp, true, abi);
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'platform_error_is_exists'
+   --> src/main.fin:85:29
+    |
+ 85 |         let exists <bool> = platform_error_is_exists();
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_write'
+   --> src/main.fin:95:27
+    |
+ 95 |         let wrote <int> = file_write(fd, &chars[done], count - done);
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_flush'
+   --> src/main.fin:101:16
+     |
+ 101 |     if (ok && !file_flush(fd)) { ok = false; }
+     |                ^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_close'
+   --> src/main.fin:102:10
+     |
+ 102 |     if (!file_close(fd)) { ok = false; }
+     |          ^^^^^^^^^^^^^^ here
+error: Undefined function or type 'rename_in_directory'
+   --> src/main.fin:104:16
+     |
+ 104 |     if (ok && !rename_in_directory(dir, temp, dest)) { ok = false; }
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'unlink_in_directory'
+   --> src/main.fin:105:16
+     |
+ 105 |     if (!ok) { unlink_in_directory(dir, temp); }
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'directory_flush'
+   --> src/main.fin:106:15
+     |
+ 106 |     else if (!directory_flush(dir)) { ok = false; }
+     |               ^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined type 'DirHandle'
+   --> src/main.fin:111:23
+     |
+ 111 | fun list_md_files(fd: DirHandle) <FileList> {
+     |                       ^^^^^^^^^ here
+error: Undefined function or type 'directory_path'
+   --> src/main.fin:112:25
+     |
+ 112 |     let path <string> = directory_path(fd);
+     |                         ^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'tpl_render'
+   --> src/main.fin:226:25
+     |
+ 226 |     let page <string> = tpl_render(layout, site_title, title, date, content);
+     |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined type 'OpenFlags'
+   --> src/main.fin:231:86
+     |
+ 231 | fun build_site(content: string, layout_dir: string, out: string, title: string, abi: OpenFlags) <int> {
+     |                                                                                      ^^^^^^^^^ here
+error: Undefined function or type 'platform_open_directory'
+   --> src/main.fin:232:23
+     |
+ 232 |     let input <int> = platform_open_directory(content, false, abi);
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_close'
+   --> src/main.fin:237:29
+     |
+ 237 |         free_files(&files); file_close(input); return 1;
+     |                             ^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_close'
+   --> src/main.fin:242:29
+     |
+ 242 |         free_files(&files); file_close(input); return 1;
+     |                             ^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'platform_open_directory'
+   --> src/main.fin:245:27
+     |
+ 245 |     let layout_fd <int> = platform_open_directory(layout_dir, false, abi);
+     |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'platform_error_is_missing'
+   --> src/main.fin:248:14
+     |
+ 248 |         if (!platform_error_is_missing()) { layout_error = true; }
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_close'
+   --> src/main.fin:257:9
+     |
+ 257 |         file_close(layout_fd);
+     |         ^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_close'
+   --> src/main.fin:261:47
+     |
+ 261 |         free_str(layout); free_files(&files); file_close(input); return 1;
+     |                                               ^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'platform_open_directory'
+   --> src/main.fin:263:24
+     |
+ 263 |     let output <int> = platform_open_directory(out, true, abi);
+     |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_close'
+   --> src/main.fin:266:47
+     |
+ 266 |         free_str(layout); free_files(&files); file_close(input); return 1;
+     |                                               ^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_close'
+   --> src/main.fin:277:9
+     |
+ 277 |         file_close(output); free_str(layout); free_files(&files); file_close(input); return 1;
+     |         ^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_close'
+   --> src/main.fin:277:67
+     |
+ 277 |         file_close(output); free_str(layout); free_files(&files); file_close(input); return 1;
+     |                                                                   ^^^^^^^^^^^^^^^^^ here
+error: Undefined type 'TextBuffer'
+   --> src/main.fin:279:16
+     |
+ 279 |     let index <TextBuffer> = text_buffer();
+     |                ^^^^^^^^^^ here
+error: Undefined function or type 'text_buffer'
+   --> src/main.fin:279:30
+     |
+ 279 |     let index <TextBuffer> = text_buffer();
+     |                              ^^^^^^^^^^^^^ here
+error: Undefined function or type 'text_append'
+   --> src/main.fin:280:5
+     |
+ 280 |     text_append(&index, "<h1>"); md_escape_into(&index, title); text_append(&index, "</h1>\n<ul>\n");
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'md_escape_into'
+   --> src/main.fin:280:34
+     |
+ 280 |     text_append(&index, "<h1>"); md_escape_into(&index, title); text_append(&index, "</h1>\n<ul>\n");
+     |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'text_append'
+   --> src/main.fin:280:65
+     |
+ 280 |     text_append(&index, "<h1>"); md_escape_into(&index, title); text_append(&index, "</h1>\n<ul>\n");
+     |                                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'md_to_html'
+   --> src/main.fin:290:34
+     |
+ 290 |         let fragment? <string> = md_to_html(meta.body);
+     |                                  ^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'text_append'
+   --> src/main.fin:298:13
+     |
+ 298 |             text_append(&index, "<li><a href=\""); filename_url(&index, dest); text_append(&index, "\">"); md_escape_into(&index, meta.title); text_append(&index, "</a>");
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'filename_url'
+   --> src/main.fin:298:52
+     |
+ 298 |             text_append(&index, "<li><a href=\""); filename_url(&index, dest); text_append(&index, "\">"); md_escape_into(&index, meta.title); text_append(&index, "</a>");
+     |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'text_append'
+   --> src/main.fin:298:80
+     |
+ 298 |             text_append(&index, "<li><a href=\""); filename_url(&index, dest); text_append(&index, "\">"); md_escape_into(&index, meta.title); text_append(&index, "</a>");
+     |                                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'md_escape_into'
+   --> src/main.fin:298:108
+     |
+ 298 |             text_append(&index, "<li><a href=\""); filename_url(&index, dest); text_append(&index, "\">"); md_escape_into(&index, meta.title); text_append(&index, "</a>");
+     |                                                                                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'text_append'
+   --> src/main.fin:298:144
+     |
+ 298 |             text_append(&index, "<li><a href=\""); filename_url(&index, dest); text_append(&index, "\">"); md_escape_into(&index, meta.title); text_append(&index, "</a>");
+     |                                                                                                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'text_append'
+   --> src/main.fin:299:39
+     |
+ 299 |             if (len(meta.date) > 0) { text_append(&index, " <span class=\"date\">"); md_escape_into(&index, meta.date); text_append(&index, "</span>"); }
+     |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'md_escape_into'
+   --> src/main.fin:299:86
+     |
+ 299 |             if (len(meta.date) > 0) { text_append(&index, " <span class=\"date\">"); md_escape_into(&index, meta.date); text_append(&index, "</span>"); }
+     |                                                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'text_append'
+   --> src/main.fin:299:121
+     |
+ 299 |             if (len(meta.date) > 0) { text_append(&index, " <span class=\"date\">"); md_escape_into(&index, meta.date); text_append(&index, "</span>"); }
+     |                                                                                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'text_append'
+   --> src/main.fin:300:13
+     |
+ 300 |             text_append(&index, "</li>\n");
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'text_append'
+   --> src/main.fin:305:5
+     |
+ 305 |     text_append(&index, "</ul>\n");
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'text_finish'
+   --> src/main.fin:306:26
+     |
+ 306 |     let body? <string> = text_finish(&index);
+     |                          ^^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_close'
+   --> src/main.fin:313:5
+     |
+ 313 |     file_close(output); file_close(input); free_str(layout); free_files(&files);
+     |     ^^^^^^^^^^^^^^^^^^ here
+error: Undefined function or type 'file_close'
+   --> src/main.fin:313:25
+     |
+ 313 |     file_close(output); file_close(input); free_str(layout); free_files(&files);
+     |                         ^^^^^^^^^^^^^^^^^ here
+error: Undefined type 'OpenFlags'
+   --> src/main.fin:321:14
+     |
+ 321 |     let abi <OpenFlags> = detect_open_flags();
+     |              ^^^^^^^^^ here
+error: Undefined function or type 'detect_open_flags'
+   --> src/main.fin:321:27
+     |
+ 321 |     let abi <OpenFlags> = detect_open_flags();
+     |                           ^^^^^^^^^^^^^^^^^^^ here
