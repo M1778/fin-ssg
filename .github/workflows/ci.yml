@@ -62,7 +62,49 @@ jobs:
       # tests/smoke.py builds the example site and asserts on the emitted files, checks the
       # open-flag mapping, and runs the security, CLI, filesystem and limits regressions. It is
       # invoked through smoke.sh so the invocation lives in one place for local and CI runs.
-      - name: Run the smoke and regression suite
+      #
+      # Linux only, because that is what the generator supports. `detect_open_flags` reads
+      # `uname` and returns ok:false for anything that is not Linux, and the generator then
+      # reports "requires Linux x86_64 or aarch64" and exits 1. On macOS that is the correct
+      # answer, not a broken build, so this step asserts the refusal instead of expecting the
+      # suite to pass -- a lane that skipped silently would leave the README's platform claim
+      # unbacked either way, and a lane that went red would claim a regression that is not one.
+      - name: Run the smoke and regression suite (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         timeout-minutes: 15
         run: sh tests/smoke.sh
+
+      - name: Assert the documented refusal on this platform (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -eu
+          finc -I src/vendor src/main.fin -o "$RUNNER_TEMP/fin-ssg"
+          set +e
+          "$RUNNER_TEMP/fin-ssg" -c example/content -l example/layout -o "$RUNNER_TEMP/site" 2>"$RUNNER_TEMP/err.txt"
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/err.txt"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the generator succeeded on macOS, so detect_open_flags now supports"
+            echo "::error::it. Update the README's platform table and run the full suite here."
+            exit 1
+          fi
+          grep -q "requires Linux" "$RUNNER_TEMP/err.txt" || {
+            echo "::error::macOS failed for a reason other than the documented refusal"
+            exit 1
+          }
+
+      - name: Assert the Windows build links and refuses (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -eu
+          finc -I src/vendor src/main.fin -o "$RUNNER_TEMP/fin-ssg.exe"
+          # Building is the claim this lane backs: the Windows branch contains @defines for
+          # CreateFileA, MoveFileExA and the rest, and a syntax error in them is invisible on
+          # every other platform. Whether the generator then runs is a separate statement,
+          # and the README says it does not.
+          "$RUNNER_TEMP/fin-ssg.exe" --help > "$RUNNER_TEMP/help.txt" 2>&1 || true
+          cat "$RUNNER_TEMP/help.txt"
