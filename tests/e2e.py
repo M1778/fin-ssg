@@ -442,10 +442,16 @@ def test_cli(binary, work):
     ok("reserved index.md", site(binary, reserved, work / "reserved-out"), expected=1)
     check(not (work / "reserved-out").exists(), "no output for reserved index.md")
     (reserved / "index.md").unlink()
+
+    # Two names that differ only by case are one output file on a
+    # case-insensitive filesystem, so the tool folds case on every platform
+    # and refuses the collision rather than publishing one page over the
+    # other. It must do so before creating the output directory.
     write(reserved / "Page.md", "# a\n")
     write(reserved / "page.md", "# b\n")
-    ok("case-folded collision", site(binary, reserved, work / "reserved-out"), expected=1)
-    check(not (work / "reserved-out").exists(), "no output for case-folded collision")
+    collision_out = work / "collision-out"
+    ok("case-folded collision", site(binary, reserved, collision_out), expected=1)
+    check(not collision_out.exists(), "no output for case-folded collision")
 
 
 def test_limits(binary, work):
