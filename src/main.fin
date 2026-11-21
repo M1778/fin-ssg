@@ -252,7 +252,7 @@ fun? render_page(layout: string, site_title: string, title: string, date: string
 }
 
 fun build_site(content: string, layout_dir: string, out: string, title: string, abi: OpenFlags) <int> {
-    let input <int> = platform_open_directory(content, false, abi);
+    let input <DirHandle> = platform_open_directory(content, false, abi);
     if (input < 0) { printf("error: content must be a readable, non-symlink directory: %s\n", content); return 1; }
     let files <FileList> = list_md_files(input);
     if (!files.ok || files.count == 0) {
@@ -265,7 +265,7 @@ fun build_site(content: string, layout_dir: string, out: string, title: string, 
         free_files(&files); file_close(input); return 1;
     }
     let layout <string> = clone(default_layout());
-    let layout_fd <int> = platform_open_directory(layout_dir, false, abi);
+    let layout_fd <DirHandle> = platform_open_directory(layout_dir, false, abi);
     let layout_error <bool> = false;
     if (layout_fd < 0) {
         if (!platform_error_is_missing()) { layout_error = true; }
@@ -283,7 +283,7 @@ fun build_site(content: string, layout_dir: string, out: string, title: string, 
         printf("error: unsafe/unreadable layout or input exceeds 4 MiB\n");
         free_str(layout); free_files(&files); file_close(input); return 1;
     }
-    let output <int> = platform_open_directory(out, true, abi);
+    let output <DirHandle> = platform_open_directory(out, true, abi);
     if (output < 0) {
         printf("error: cannot open/create non-symlink output directory: %s\n", out);
         free_str(layout); free_files(&files); file_close(input); return 1;

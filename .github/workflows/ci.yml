@@ -59,6 +59,27 @@ jobs:
         shell: bash
         run: finc -I src/vendor src/main.fin
 
+      # A branch only one platform parses cannot be found wrong by any other lane. Two
+      # syntax errors in the Windows branch of platform.fin shipped before this check existed
+      # (a hard-keyword parameter, and a hex literal, which Fin has none of), and each cost a
+      # ten-minute CI round trip that reported one error at a time.
+      #
+      # This flips the guards so the other platform's branch becomes the live one, runs the
+      # front end here, and restores the file. `@define`d C functions never link and do not
+      # need to: a lexical, syntactic or type error is found before code generation.
+      - name: Type-check the branch this platform cannot compile
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python tests/tools/check_foreign_branches.py --finc finc \
+              --file src/vendor/platform.fin --needle FIN_TARGET_LINUX \
+              --entry src/main.fin --include src/vendor
+          else
+            python tests/tools/check_foreign_branches.py --finc finc \
+              --file src/vendor/platform.fin --needle FIN_TARGET_WINDOWS \
+              --entry src/main.fin --include src/vendor
+          fi
+
       # tests/smoke.py builds the example site and asserts on the emitted files, checks the
       # open-flag mapping, and runs the security, CLI, filesystem and limits regressions. It is
       # invoked through smoke.sh so the invocation lives in one place for local and CI runs.
