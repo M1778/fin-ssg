@@ -63,12 +63,12 @@ def finish(label):
     The ordinal is what makes a failure in CI diagnosable without a debugger:
     "CLI contract #7" is a line you can count, "CLI contract" is not.
     """
-    state = {"n": 0, "detail": ""}
+    state = {"n": 0}
 
     def check(condition, detail=""):
         state["n"] += 1
         if not condition:
-            where = f" [{state['detail']}]" if state["detail"] else ""
+            where = f" [{detail}]" if detail else ""
             raise SystemExit(f"failed: {label} #{state['n']}{where}")
     return check
 
