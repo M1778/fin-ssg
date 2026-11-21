@@ -52,6 +52,16 @@ jobs:
       # rejects as a disabled command and which fails the step. The PATH is
       # set by the next step through $GITHUB_PATH instead, so the line is
       # filtered out here rather than the shared script being forked.
+      #
+      # The published macOS artifact is linked against Homebrew's LLVM 22
+      # (/opt/homebrew/opt/llvm@22/lib/libLLVM.dylib), so that keg must exist
+      # before the compiler can run at all. The Linux musl artifact is static
+      # and needs nothing; the glibc one is avoided for this same reason.
+      - name: Install the LLVM the macOS artifact links against
+        if: runner.os == 'macOS'
+        shell: bash
+        run: brew install llvm@22
+
       - name: Install finc
         shell: bash
         run: |
