@@ -28,14 +28,17 @@ jobs:
         # It is a matrix value rather than an expression because an empty
         # string is falsy in a GitHub expression, so `A && '' || B` yields B.
         include:
+          # The "-latest" labels are the ones that actually receive runners in
+          # this account; a pinned `macos-14` sat unassigned and was cancelled
+          # at zero seconds, which reads as a failure but proves nothing.
           - name: linux-x86_64
-            os: ubuntu-24.04
+            os: ubuntu-latest
             ldflags: "-lm"
           - name: macos-arm64
-            os: macos-14
+            os: macos-latest
             ldflags: "-lm"
           - name: windows-x86_64
-            os: windows-2022
+            os: windows-latest
             ldflags: "-llegacy_stdio_definitions"
 
     steps:
