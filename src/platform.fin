@@ -104,8 +104,18 @@ pub fun has_parent_step(path: string) <bool> {
 
 // Whether one path component can be appended to a directory. This is the
 // guard that keeps a generated output name inside the output directory on
-// every platform: `/`, `\` and NUL never appear in a name, and neither `.`
-// nor `..` names anything.
+// every platform: no separator, and neither `.` nor `..` names anything.
+//
+// WHAT IT CANNOT CHECK, and why. A Fin `string` is NUL-terminated and carries no length, so
+// `len` is `strlen` and stops at the first NUL. An input holding `a` NUL `b` therefore looks
+// exactly like `a`: the check below can never see the NUL, and the file written would be `a`.
+// An earlier version of this comment claimed NUL was refused; it was not, and a test written
+// to assert the claim is what found it. `open_directory` has the same limit.
+//
+// This is safe for the names the generator builds, which come from a slug of a title with
+// every non-alphanumeric byte replaced. It is not a general-purpose guard, and a caller that
+// accepts a name from somewhere else should hand this function bytes (`[char]`) and a length
+// together rather than a `string`.
 pub fun component_ok(name: string) <bool> {
     if (name == null) { return false; }
     let n <int> = len(name);
@@ -114,7 +124,7 @@ pub fun component_ok(name: string) <bool> {
     let chars <[char]> = to_chars(name);
     let ok <bool> = true;
     for (let i <int> = 0; ok && i < n; i++) {
-        if (is_separator(chars[i]) || chars[i] == cast<char>(0)) { ok = false; }
+        if (is_separator(chars[i])) { ok = false; }
     }
     delete chars;
     return ok;
