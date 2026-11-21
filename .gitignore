@@ -1,3 +1,11 @@
 fin-ssg
+fin-ssg.exe
 public/
 .finn/
+.finc/
+out/
+build-test
+build-test.exe
+markdown-test
+markdown-test.exe
+*.o

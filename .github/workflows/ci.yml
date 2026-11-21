@@ -1,69 +1,88 @@
 name: CI
 
+# Three platforms, and every one compiles the generator, runs the library
+# tests, builds the example site and asserts on the published files. A lane
+# that only type-checked would not be testing this project.
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, production/hardening]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # A toolchain download plus a full site build is minutes, not tens.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+          - name: macos-arm64
+            os: macos-14
+          - name: windows-x86_64
+            os: windows-2022
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build tools
+      # The version under test is one file, and the shared installer verifies
+      # the archive's sha256 against the published index before unpacking it.
+      # On Linux it picks the musl artifact, which is static: the glibc one
+      # links libLLVM.so.22.1 and does not start without it.
+      - name: Install finc
+        shell: bash
+        run: python3 .github/scripts/install_finc.py
+
+      - name: Put finc on PATH
+        shell: bash
+        run: echo "$PWD/.finc/bin" >> "$GITHUB_PATH"
+
+      - name: Verify the installed compiler
+        shell: bash
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake ninja-build bison flex python3 pipx clang gpg curl git
-          pipx install conan
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          finc --version
+          finc --version | grep -q 'contract 3'
 
-      - name: Install LLVM 22
-        run: |
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor | sudo tee /usr/share/keyrings/llvm-archive-keyring.gpg > /dev/null
-          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm22.list > /dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq llvm-22-dev clang-22 libllvm22
-
-      - name: Restore finc toolchain cache
-        id: finc-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            /tmp/Fin
-            ~/.conan2
-          key: finc-toolchain-v1
-
-      - name: Build finc (on cache miss)
-        if: steps.finc-restore.outputs.cache-hit != 'true'
-        run: |
-          export PATH="$HOME/.local/bin:/usr/lib/llvm-22/bin:$PATH"
-          git clone --depth 1 https://github.com/M1778/Fin.git /tmp/Fin
-          cd /tmp/Fin && ./build.sh --release --no-test
-
-      - name: Save finc toolchain cache
-        if: steps.finc-restore.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            /tmp/Fin
-            ~/.conan2
-          key: finc-toolchain-v1
-
-      - name: finc version
-        run: |
-          echo "/tmp/Fin/build" >> "$GITHUB_PATH"
-          /tmp/Fin/build/finc --version
+      # The header rule is enforced where it can be, not just documented.
+      - name: Source headers
+        shell: bash
+        run: python3 scripts/fin_header.py --repo fin-ssg --license MIT --check src tests scripts
 
       - name: Frontend check
-        run: |
-          finc -I src/vendor src/main.fin
+        shell: bash
+        run: finc -I src src/main.fin
 
-      - name: Build executable
-        run: |
-          finc -I src/vendor src/main.fin -o fin-ssg
+      - name: Build the generator
+        shell: bash
+        run: finc -I src src/main.fin -o fin-ssg${{ runner.os == 'Windows' && '.exe' || '' }}
 
-      - name: Smoke test
+      - name: Library tests
+        shell: bash
         run: |
-          sh tests/smoke.sh
+          finc -I src tests/markdown_test.fin -o markdown-test${{ runner.os == 'Windows' && '.exe' || '' }}
+          ./markdown-test${{ runner.os == 'Windows' && '.exe' || '' }}
+
+      # The suite builds its own copy of the generator and asserts on the
+      # published site, so this step is the one that proves the tool works.
+      - name: End-to-end site tests
+        shell: bash
+        run: python3 -I tests/e2e.py --finc finc
+
+      # The manifest is part of the product: prove the real package manager
+      # can consume it, rather than leaving that claim to a human.
+      - name: finn can consume the manifest
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo install finn --git https://github.com/M1778/finn
+          FIN_COMPILER_PATH="$PWD/.finc/bin/finc" finn build
+          ./out/fin-ssg --help > /dev/null
+          FIN_COMPILER_PATH="$PWD/.finc/bin/finc" finn test
