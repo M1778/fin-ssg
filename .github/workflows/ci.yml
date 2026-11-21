@@ -112,8 +112,15 @@ jobs:
             echo "::error::it. Update the README's platform table and run the full suite here."
             exit 1
           fi
+          # Two lines, and both are the documented shape: the platform it saw, and the
+          # decision it took. Matching only the first would pass on a message that stopped
+          # explaining itself.
           grep -q "requires Linux" "$RUNNER_TEMP/err.txt" || {
             echo "::error::macOS failed for a reason other than the documented refusal"
+            exit 1
+          }
+          grep -q "cannot select safe Linux open flags" "$RUNNER_TEMP/err.txt" || {
+            echo "::error::the refusal lost its second line, which says what it did about it"
             exit 1
           }
 
