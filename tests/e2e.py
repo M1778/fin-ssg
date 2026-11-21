@@ -443,15 +443,26 @@ def test_cli(binary, work):
     check(not (work / "reserved-out").exists(), "no output for reserved index.md")
     (reserved / "index.md").unlink()
 
-    # Two names that differ only by case are one output file on a
-    # case-insensitive filesystem, so the tool folds case on every platform
-    # and refuses the collision rather than publishing one page over the
-    # other. It must do so before creating the output directory.
-    write(reserved / "Page.md", "# a\n")
-    write(reserved / "page.md", "# b\n")
-    collision_out = work / "collision-out"
-    ok("case-folded collision", site(binary, reserved, collision_out), expected=1)
-    check(not collision_out.exists(), "no output for case-folded collision")
+    # Two names differing only by case are one output file on a
+    # case-insensitive filesystem, so the tool folds case on every platform and
+    # refuses the collision rather than publishing one page over the other --
+    # before creating the output directory.
+    #
+    # The situation can only be *constructed* on a case-sensitive filesystem:
+    # NTFS and APFS make Page.md and page.md the same file, so a content tree
+    # there cannot hold the collision in the first place. The guard still
+    # matters, because it is what stops a tree authored on Linux from
+    # publishing one page over another when built on Windows.
+    collision = work / "collision-content"
+    collision.mkdir()
+    write(collision / "Page.md", "# a\n")
+    if (collision / "PAGE.md").exists():
+        print("  (case-insensitive filesystem: the collision cannot be built here, skipped)")
+    else:
+        write(collision / "page.md", "# b\n")
+        collision_out = work / "collision-out"
+        ok("case-folded collision", site(binary, collision, collision_out), expected=1)
+        check(not collision_out.exists(), "no output for case-folded collision")
 
 
 def test_limits(binary, work):
