@@ -107,7 +107,11 @@ pub fun linux_open_flags(system: string, machine: string) <OpenFlags> {
 @define platform_flush(handle: long) <int>;
 
 #[llvm_name="MoveFileExA"]
-@define platform_rename(from: string, to: string, flags: uint) <int>;
+// `source` rather than `from`: `from` is a hard keyword (the `import ... from` one) and
+// the lexer emits KW_FROM before the parser ever sees a parameter list. That line lives
+// inside the Windows guard, so Linux and macOS never compiled it and never noticed -- the
+// Windows lane is what a hard keyword in a dead branch costs.
+@define platform_rename(source: string, destination: string, flags: uint) <int>;
 
 #[llvm_name="DeleteFileA"]
 @define platform_unlink(path: string) <int>;
