@@ -58,9 +58,18 @@ def run(command, cwd=None, timeout=300):
 
 
 def finish(label):
-    def check(condition):
+    """A checker that names the group and the ordinal of the failing check.
+
+    The ordinal is what makes a failure in CI diagnosable without a debugger:
+    "CLI contract #7" is a line you can count, "CLI contract" is not.
+    """
+    state = {"n": 0, "detail": ""}
+
+    def check(condition, detail=""):
+        state["n"] += 1
         if not condition:
-            raise SystemExit(f"failed: {label}")
+            where = f" [{state['detail']}]" if state["detail"] else ""
+            raise SystemExit(f"failed: {label} #{state['n']}{where}")
     return check
 
 
@@ -402,36 +411,41 @@ def test_cli(binary, work):
     write(content / "ok.md", "# ok\n")
     out = work / "cli-out"
 
-    check(site(binary, content, out, title="").returncode == 0)
-    check((out / "index.html").is_file())     # an empty title is a title, not an error
+    def ok(name, result, expected=0):
+        check(result.returncode == expected,
+              f"{name}: exit {result.returncode}, wanted {expected}; "
+              f"stdout={result.stdout.strip()!r} stderr={result.stderr.strip()!r}")
+
+    ok("empty title builds", site(binary, content, out, title=""))
+    check((out / "index.html").is_file(), "index.html from an empty title")
 
     help_result = subprocess.run([str(binary), "--help"], text=True, capture_output=True, timeout=60)
-    check(help_result.returncode == 0)
-    check("usage: fin-ssg" in help_result.stdout)
-    check("--content" in help_result.stdout)
+    ok("--help", help_result)
+    check("usage: fin-ssg" in help_result.stdout, "--help text")
+    check("--content" in help_result.stdout, "--help lists --content")
 
-    check(subprocess.run([str(binary), "unexpected"], text=True,
-                         capture_output=True, timeout=60).returncode == 1)
-    check(subprocess.run([str(binary), "--nope"], text=True,
-                         capture_output=True, timeout=60).returncode == 1)
-    check(site(binary, work / "absent", work / "absent-out").returncode == 1)
-    check(not (work / "absent-out").exists())
+    ok("positional argument", subprocess.run([str(binary), "unexpected"], text=True,
+                                            capture_output=True, timeout=60), expected=1)
+    ok("unknown option", subprocess.run([str(binary), "--nope"], text=True,
+                                       capture_output=True, timeout=60), expected=1)
+    ok("absent content", site(binary, work / "absent", work / "absent-out"), expected=1)
+    check(not (work / "absent-out").exists(), "no output for absent content")
 
     empty = work / "empty-content"
     empty.mkdir()
-    check(site(binary, empty, work / "empty-out").returncode == 1)
+    ok("empty content", site(binary, empty, work / "empty-out"), expected=1)
 
     # A reserved homepage and case-folded collisions fail before any write.
     reserved = work / "reserved-content"
     reserved.mkdir()
     write(reserved / "index.md", "# authored home\n")
-    check(site(binary, reserved, work / "reserved-out").returncode == 1)
-    check(not (work / "reserved-out").exists())
+    ok("reserved index.md", site(binary, reserved, work / "reserved-out"), expected=1)
+    check(not (work / "reserved-out").exists(), "no output for reserved index.md")
     (reserved / "index.md").unlink()
     write(reserved / "Page.md", "# a\n")
     write(reserved / "page.md", "# b\n")
-    check(site(binary, reserved, work / "reserved-out").returncode == 1)
-    check(not (work / "reserved-out").exists())
+    ok("case-folded collision", site(binary, reserved, work / "reserved-out"), expected=1)
+    check(not (work / "reserved-out").exists(), "no output for case-folded collision")
 
 
 def test_limits(binary, work):
