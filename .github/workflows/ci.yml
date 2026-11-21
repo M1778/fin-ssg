@@ -37,9 +37,15 @@ jobs:
       # the archive's sha256 against the published index before unpacking it.
       # On Linux it picks the musl artifact, which is static: the glibc one
       # links libLLVM.so.22.1 and does not start without it.
+      # The shared installer ends with `::add-path::`, which the runner now
+      # rejects as a disabled command and which fails the step. The PATH is
+      # set by the next step through $GITHUB_PATH instead, so the line is
+      # filtered out here rather than the shared script being forked.
       - name: Install finc
         shell: bash
-        run: python3 .github/scripts/install_finc.py
+        run: |
+          set -o pipefail
+          python3 .github/scripts/install_finc.py | grep -v '^::add-path::'
 
       - name: Put finc on PATH
         shell: bash
