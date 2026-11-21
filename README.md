@@ -205,9 +205,9 @@ merging, link titles, reference images, footnote syntax, underscore emphasis.
 
 | Platform | Status |
 | -------- | ------ |
-| Linux x86_64 | Built and tested (the CI lane, and this repository's development host). |
-| Windows x86_64 | Built and tested in CI on `windows-2022`. |
-| macOS arm64 | Built and tested in CI on `macos-14`. |
+| Linux x86_64 | Built and tested — CI lane, and this repository's development host. |
+| Windows x86_64 | Built and tested in CI. |
+| macOS arm64 | Built and tested in CI. |
 | Linux aarch64, macOS x86_64 | Expected to work, **not tested**. |
 
 The filesystem layer is written entirely against `fs::std` and `path::std`, so
@@ -217,10 +217,22 @@ on Windows. No compiled C bridge is required, and no path is built by joining
 strings with `/`: `normalize` applies the target's own separator rules and
 knows that `C:\` is a drive rather than a directory name.
 
-Two platform notes:
+One constant is per target rather than from the standard library: the
+`O_NONBLOCK` used to refuse a FIFO without blocking on it. It is 0x800 on
+Linux, 0x4 on macOS and a different `_open` flag set on Windows, and getting
+it wrong does not fail loudly — the open simply blocks. `nonblocking_read_flags`
+in `src/platform.fin` states each value once.
 
-- The published *glibc* `finc` artifact for Linux does not start on a machine
-  without `libLLVM.so.22.1`; use the musl artifact, as above.
+Platform notes:
+
+- The published Linux *glibc* artifact does not start without
+  `libLLVM.so.22.1`, and the macOS artifact needs Homebrew's `llvm@22` keg.
+  Both are dynamically linked against LLVM; only the Linux musl archive is
+  static. Use it, as above.
+- `finc` links every program it builds against `-lLLVM-22` even when that
+  program uses no LLVM symbol, so building on a machine with no LLVM
+  development library needs `FIN_LDFLAGS` to replace the default library
+  list. CI does this; the commands above assume a machine that has LLVM.
 - On Windows, renaming over an existing file is not atomic, so `write_atomic`
   removes the destination first. The window is small but real; POSIX
   platforms rename over it in one step.
@@ -254,11 +266,13 @@ What was actually run, on Linux x86_64:
   compares every published file byte-for-byte.
 - `finn build` and `finn test` pass with `finn` 1.0.1 against this
   `finn.toml`; `finn do test` runs the end-to-end suite too.
-- The Windows branch of `src/platform.fin` was type-checked by forcing the
-  `FIN_TARGET_WINDOWS` preprocessor define, and the release installer's zip
-  path was exercised. This machine has no Windows host, so the Windows
-  **behaviour** is covered by CI, not here.
-- macOS was not run on a developer machine. Its lane is CI only.
+- CI runs the same suite on Linux, Windows and macOS against `finc` 1.0.0
+  from the published release, and all three lanes pass. Each lane compiled
+  the generator, ran the library tests, built the example site and asserted on
+  the published files.
+- On this machine there is no Windows or macOS host, so the Windows and macOS
+  **behaviour** is proven by CI only. Their source branches were type-checked
+  by forcing `FIN_TARGET_WINDOWS` and `FIN_TARGET_DARWIN`.
 
 `finc` 1.0.1 defect this repository works around, reported upstream: when two
 imported modules export the same function name, the name binds to whichever
