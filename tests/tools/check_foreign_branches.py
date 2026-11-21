@@ -75,8 +75,20 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    # A file need not name its own platform: platform.fin guards `FIN_TARGET_WINDOWS` and
+    # lets `#c_else` be "everything else". In that shape the host's macro does not appear, and
+    # the rewrite still works -- renaming the wanted guard to the host macro makes it live and
+    # leaves the `#c_else` branches dead, which is the opposite of what the host normally
+    # compiles and therefore the thing worth checking.
+    has_host_guard = f"#c_ifdef {host}" in original
 
-    flipped = original.replace(f"#c_ifdef {host}", f"#c_ifdef {host}_DISABLED_FOR_CHECK")
+    # Two shapes occur. A file may guard both branches explicitly (`#c_ifdef X` / `#c_ifdef
+    # Y`), or guard one and let `#c_else` be the other -- which is what platform.fin does, so
+    # the POSIX branch has no macro of its own to name. The rewrite below covers both: rename
+    # the wanted guard to the host's, and disable the host's own so the two do not collide.
+    flipped = original
+    if has_host_guard:
+        flipped = flipped.replace(f"#c_ifdef {host}", f"#c_ifdef {host}_DISABLED_FOR_CHECK")
     flipped = flipped.replace(f"#c_ifdef {args.needle}", f"#c_ifdef {host}")
     if flipped == original:
         print("error: the flip changed nothing; the guard spelling is not what this expects",

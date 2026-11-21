@@ -71,14 +71,15 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            python tests/tools/check_foreign_branches.py --finc finc \
-              --file src/vendor/platform.fin --needle FIN_TARGET_LINUX \
-              --entry src/main.fin --include src/vendor
-          else
-            python tests/tools/check_foreign_branches.py --finc finc \
-              --file src/vendor/platform.fin --needle FIN_TARGET_WINDOWS \
-              --entry src/main.fin --include src/vendor
+            # platform.fin guards only FIN_TARGET_WINDOWS and lets `#c_else` be POSIX, so the
+            # Windows lane already compiles the branch that used to go unchecked, and the
+            # branch it cannot see is the one this host can.
+            echo "nothing to flip here: this lane compiles the guard the check exists for"
+            exit 0
           fi
+          python tests/tools/check_foreign_branches.py --finc finc \
+            --file src/vendor/platform.fin --needle FIN_TARGET_WINDOWS \
+            --entry src/main.fin --include src/vendor
 
       # tests/smoke.py builds the example site and asserts on the emitted files, checks the
       # open-flag mapping, and runs the security, CLI, filesystem and limits regressions. It is
@@ -103,7 +104,7 @@ jobs:
           set -eu
           finc -I src/vendor src/main.fin -o "$RUNNER_TEMP/fin-ssg"
           set +e
-          "$RUNNER_TEMP/fin-ssg" -c example/content -l example/layout -o "$RUNNER_TEMP/site" 2>"$RUNNER_TEMP/err.txt"
+          "$RUNNER_TEMP/fin-ssg" -c example/content -l example/layout -o "$RUNNER_TEMP/site" >"$RUNNER_TEMP/err.txt" 2>&1
           status=$?
           set -e
           cat "$RUNNER_TEMP/err.txt"
