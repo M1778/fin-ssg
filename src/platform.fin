@@ -169,13 +169,26 @@ pub fun close_directory(dir: &Dir) <noret> {
 @define probe_lseek(fd: int, offset: long, whence: int) <long>;
 #c_endif
 
-pub fun file_probe(path: string) <int> {
-    let flags <int> = 2048;
+// O_NONBLOCK is not the same number everywhere: 0x800 on Linux, 0x4 on
+// macOS. Getting it wrong does not fail loudly -- the open just blocks on a
+// FIFO, which is the hang this function exists to prevent -- so the value is
+// spelled per target rather than shared.
+pub fun nonblocking_read_flags() <int> {
     #c_ifdef FIN_TARGET_WINDOWS
     // _O_RDONLY is 0, _O_BINARY is 0x8000, _O_NOINHERIT is 0x80. A device
     // rejects the seek, which is the answer wanted.
-    flags = 32768 + 128;
+    return 32768 + 128;
+    #c_else
+    #c_ifdef FIN_TARGET_DARWIN
+    return 4;
+    #c_else
+    return 2048;
     #c_endif
+    #c_endif
+}
+
+pub fun file_probe(path: string) <int> {
+    let flags <int> = nonblocking_read_flags();
     let fd <int> = probe_open(path, flags, 0);
     if (fd < 0) { return 0; }
     let end <long> = probe_lseek(fd, cast<long>(0), 2);
