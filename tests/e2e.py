@@ -472,14 +472,16 @@ def test_limits(binary, work):
     content.mkdir()
     oversized = b"h" * (4 * 1024 * 1024 + 1)
     (content / "big.md").write_bytes(oversized)
-    (content / "nul.md").write_bytes(b"head\x00tail")
+    # NOT "nul.md": that is the Windows NUL device, with or without an
+    # extension, so no such file can be created or tested there.
+    (content / "embedded-nul.md").write_bytes(b"head\x00tail")
     write(content / "good.md", "# good\n")
     out = work / "limit-out"
     result = site(binary, content, out)
     check(result.returncode == 2,
           f"exit {result.returncode}; stdout={result.stdout.strip()!r} stderr={result.stderr.strip()!r}")
     check(not (out / "big.html").exists(), "no page for the over-size input")
-    check(not (out / "nul.html").exists(), "no page for the NUL input")
+    check(not (out / "embedded-nul.html").exists(), "no page for the NUL input")
     check((out / "good.html").is_file())
     check((out / "index.html").is_file())
     index = (out / "index.html").read_text(encoding="utf-8")
