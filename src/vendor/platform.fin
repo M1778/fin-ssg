@@ -201,9 +201,9 @@ pub fun name_kind(dir: DirHandle, name: string) <int> {
     free_str(path);
     if (attributes == cast<uint>(-1)) { return 0; }
     // FILE_ATTRIBUTE_DIRECTORY is 0x10 and FILE_ATTRIBUTE_REPARSE_POINT is
-    // 0x400.
-    if ((attributes & 0x10) != cast<uint>(0)) { return -1; }
-    if ((attributes & 0x400) != cast<uint>(0)) { return -1; }
+    // 1024.
+    if ((attributes & 16) != cast<uint>(0)) { return -1; }
+    if ((attributes & 1024) != cast<uint>(0)) { return -1; }
     return 1;
 }
 #c_else
@@ -287,7 +287,7 @@ pub fun platform_open_directory(path: string, create: bool) <DirHandle> {
     // component can be opened relative to the last.
     let current <string> = ".";
     if (chars[0] == '/' || chars[0] == '\\') { current = "\\"; }
-    let handle <DirHandle> = platform_create_file(current, 0, 7, null, 3, 0x02000000 | 0x00200000, null);
+    let handle <DirHandle> = platform_create_file(current, 0, 7, null, 3, 33554432 | 2097152, null);
     if (handle == invalid) { delete chars; return invalid; }
     let i <int> = 0;
     while (handle != invalid && i < total) {
@@ -301,10 +301,10 @@ pub fun platform_open_directory(path: string, create: bool) <DirHandle> {
         let base <string> = directory_path(handle);
         let child <string> = concat(base, concat("\\", part));
         free_str(base); free_str(part);
-        let next <DirHandle> = platform_create_file(child, 0, 7, null, 3, 0x02000000 | 0x00200000, null);
+        let next <DirHandle> = platform_create_file(child, 0, 7, null, 3, 33554432 | 2097152, null);
         if (next == invalid && create) {
             platform_mkdir(child, null);
-            next = platform_create_file(child, 0, 7, null, 3, 0x02000000 | 0x00200000, null);
+            next = platform_create_file(child, 0, 7, null, 3, 33554432 | 2097152, null);
         }
         platform_close_handle(handle);
         handle = next;
@@ -363,10 +363,10 @@ pub fun open_in_directory(dir: DirHandle, name: string, create: bool) <FileHandl
     free_str(base);
     // GENERIC_READ for a read, GENERIC_WRITE for a creation; the disposition
     // says whether the file must exist or must not.
-    let access <uint> = 0x80000000;
+    let access <uint> = 2147483648;
     let disposition <uint> = 3;
-    if (create) { access = 0x40000000; disposition = 1; }
-    let handle <FileHandle> = platform_create_file(path, access, 7, null, disposition, 0x02000000 | 0x00200000, null);
+    if (create) { access = 1073741824; disposition = 1; }
+    let handle <FileHandle> = platform_create_file(path, access, 7, null, disposition, 33554432 | 2097152, null);
     free_str(path);
     return handle;
 }
@@ -377,7 +377,7 @@ pub fun is_regular_file(handle: FileHandle) <bool> {
     let info <[char]> = new [char, 256]{};
     if (platform_file_info(handle, &info[0]) == 0) { delete info; return false; }
     // The attributes are at offset 32 of the BY_HANDLE_FILE_INFORMATION
-    // structure, and FILE_ATTRIBUTE_DIRECTORY is 0x10.
+    // structure, and FILE_ATTRIBUTE_DIRECTORY is 16.
     let attributes <int> = (cast<int>(info[32]) & 255) + (cast<int>(info[33]) & 255) * 256;
     delete info;
     if ((attributes & 16) == 16) { return false; }
@@ -490,7 +490,7 @@ pub fun detect_open_flags() <OpenFlags> {
     // FILE_FLAG_BACKUP_SEMANTICS is what lets a directory be opened at all.
     // FILE_FLAG_OPEN_REPARSE_POINT refuses to follow a symlink, which is what
     // the nofollow check needs.
-    return OpenFlags{directory: 0x02000000, read_file: 0x02000000, create_file: 0x02000000, ok: true};
+    return OpenFlags{directory: 33554432, read_file: 33554432, create_file: 33554432, ok: true};
     #c_else
     let info <[char]> = new [char, 390]{};
     if (platform_uname(&info[0]) != 0) { delete info; return OpenFlags{directory: 0, read_file: 0, create_file: 0, ok: false}; }
