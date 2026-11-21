@@ -47,9 +47,16 @@ jobs:
           set -o pipefail
           python3 .github/scripts/install_finc.py | grep -v '^::add-path::'
 
+      # $GITHUB_PATH takes a native path: a POSIX-form path written from bash
+      # is unusable to a native Windows Python, which is what runs the tests.
       - name: Put finc on PATH
         shell: bash
-        run: echo "$PWD/.finc/bin" >> "$GITHUB_PATH"
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "$(cygpath -w "$PWD/.finc/bin")" >> "$GITHUB_PATH"
+          else
+            echo "$PWD/.finc/bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Verify the installed compiler
         shell: bash
@@ -66,12 +73,21 @@ jobs:
         shell: bash
         run: finc -I src src/main.fin
 
+      # finc links every program against -lLLVM-22 even when the program uses
+      # none of it, and a runner has no LLVM development library. FIN_CC names
+      # the driver and FIN_LDFLAGS replaces the default library list, which is
+      # the documented way to build where that library is absent. The musl
+      # compiler is statically linked, so it needs no LLVM at run time either.
       - name: Build the generator
         shell: bash
+        env:
+          FIN_LDFLAGS: ${{ runner.os == 'Windows' && '' || '-lm' }}
         run: finc -I src src/main.fin -o fin-ssg${{ runner.os == 'Windows' && '.exe' || '' }}
 
       - name: Library tests
         shell: bash
+        env:
+          FIN_LDFLAGS: ${{ runner.os == 'Windows' && '' || '-lm' }}
         run: |
           finc -I src tests/markdown_test.fin -o markdown-test${{ runner.os == 'Windows' && '.exe' || '' }}
           ./markdown-test${{ runner.os == 'Windows' && '.exe' || '' }}
@@ -80,6 +96,8 @@ jobs:
       # published site, so this step is the one that proves the tool works.
       - name: End-to-end site tests
         shell: bash
+        env:
+          FIN_LDFLAGS: ${{ runner.os == 'Windows' && '' || '-lm' }}
         run: python3 -I tests/e2e.py --finc finc
 
       # The manifest is part of the product: prove the real package manager
